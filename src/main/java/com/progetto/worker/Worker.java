@@ -8,6 +8,7 @@ import com.progetto.rmi.JobNotCompletedException;
 import com.progetto.rmi.JobNotFoundException;
 import com.progetto.rmi.WorkerRemote;
 
+import java.rmi.NotBoundException;
 import java.rmi.RemoteException;
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
@@ -15,6 +16,7 @@ import java.rmi.server.UnicastRemoteObject;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -27,6 +29,9 @@ public class Worker implements WorkerRemote {
     private final BlockingQueue<Job> queue = new LinkedBlockingQueue<>();
     private final ConcurrentHashMap<String, Job> jobs = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, JobResult> results = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, WorkerRemote> peers = new ConcurrentHashMap<>();
+
+    private WorkerRemote selfStub; //stub of local worker to send to the other nodes
 
     public Worker(String workerId) {
         this.workerId = workerId;
@@ -69,6 +74,30 @@ public class Worker implements WorkerRemote {
             throw new JobNotCompletedException(jobId, job.getStatus());
         }
         return result;
+    }
+
+    @Override
+    public void registerPeer(String peerId, WorkerRemote peerStub) throws RemoteException{
+        //Avoid registering itself
+        if (peerId.equals(this.workerId)) return;
+        if (!peers.containsKey(peerId)) {
+            peers.put(peerId, peerStub);
+            //Debugging print
+            networkLog(peerId, "added");
+        }
+    }
+
+    /*TODO: Capire se questa funzione serve...al massimo per uscire gracefully */
+    @Override
+    public void unregisterPeer(String peerId) throws RemoteException {
+        if (peers.remove(peerId) != null) {
+            networkLog(peerId, "removed");
+        }
+    }
+
+    @Override
+    public Map<String, WorkerRemote> getKnownPeers() throws RemoteException {
+        return this.peers;
     }
 
     private void processLoop() {
@@ -161,33 +190,89 @@ public class Worker implements WorkerRemote {
                 LocalDateTime.now(), workerId, job.getJobId(), job.getStatus(), message);
     }
 
-    public static void start(String workerId, int port) throws RemoteException {
+    private void networkLog(String peerId, String message){
+        System.out.printf("[%s] [worker=%s] :: %s%n",
+                LocalDateTime.now(), workerId, message + " " + peerId);
+    }
+
+    public static Worker start(String workerId, int port) throws RemoteException {
         // Default RMI response timeout is effectively unbounded;
         System.setProperty("sun.rmi.transport.tcp.responseTimeout", "5000");
 
         Worker worker = new Worker(workerId);
         WorkerRemote stub = (WorkerRemote) UnicastRemoteObject.exportObject(worker, 0);
+        worker.selfStub = stub; //selfStub inizialization
 
         Registry registry = LocateRegistry.createRegistry(port);
         String bindName = "worker/" + workerId;
         registry.rebind(bindName, stub);
 
         System.out.printf("Worker '%s' ready. Bound as '%s' on port %d%n", workerId, bindName, port);
+        return worker;
     }
 
+    public void joinNetwork(String targetHost, int targetPort, String targetWorkerId){
+        try{
+            //Getting stub of targetPeer from RMI registry of seed node
+            networkLog(targetWorkerId, "connecting to");
+            Registry registry = LocateRegistry.getRegistry(targetHost, targetPort);
+            WorkerRemote targetPeer = (WorkerRemote) registry.lookup("worker/" + targetWorkerId);
+            //Adding seed node to local map
+            this.peers.put(targetWorkerId, targetPeer);
+            //Getting peer list from seed node and updating local map
+            Map<String, WorkerRemote> remotePeers = targetPeer.getKnownPeers();
+            for(Map.Entry<String, WorkerRemote> entry : remotePeers.entrySet()){
+                if(!entry.getKey().equals(workerId)){
+                    this.peers.put(entry.getKey(), entry.getValue());
+                }
+            }
+            //Contacting all remote peers acquired to perform handshake
+            List<String> failedPeers = new ArrayList<>();
+            for(Map.Entry<String, WorkerRemote> entry : this.peers.entrySet()){
+                try{
+                    entry.getValue().registerPeer(this.workerId, this.selfStub);
+                    networkLog(entry.getKey(), "handshake completed with");
+                } catch (RemoteException e){
+                    System.err.println("Failed to register to remote worker " + entry.getKey() + ": " + e.getMessage());
+                    failedPeers.add(entry.getKey());
+                }
+            }
+
+            for(String deadPeer : failedPeers) {
+                this.peers.remove(deadPeer);
+            }
+        }
+        catch (NotBoundException e){
+            System.err.println("No worker found with id " + targetWorkerId);
+        }
+        catch (RemoteException e){
+            System.err.println("Failed to connect to seed node (" + targetWorkerId + "): " + e.getMessage());
+        }
+    }
+
+    /*TODO: Non mi convincono al 100% le condizioni di controllo degli args 
+    */
     public static void main(String[] args) {
-        if (args.length < 1) {
-            System.err.println("Usage: Worker <port> [workerId]");
+        if (args.length != 2 && args.length != 5) {
+            System.err.println("Usage: Worker <port> <workerId> [seedNodeIP] [seedNodePort] [seedNodeId]");
             System.exit(1);
         }
         int port = Integer.parseInt(args[0]);
-        String workerId = args.length > 1 ? args[1] : "worker-1";
+        String workerId = args[1];
+        Worker worker = null;
 
         try {
-            start(workerId, port);
+            worker = start(workerId, port);
         } catch (RemoteException e) {
             System.err.println("Failed to start worker RMI server: " + e.getMessage());
             System.exit(1);
+        }
+
+        if(args.length > 2){
+            String targetHost = args[2];
+            int targetPort = Integer.parseInt(args[3]);
+            String targetId = args[4];
+            worker.joinNetwork(targetHost, targetPort, targetId);
         }
     }
 }
