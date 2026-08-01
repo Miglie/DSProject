@@ -12,8 +12,8 @@ Inizialmente, per compilare: mvn compile
 
 Parametri:
 
-- worker indipendente <Port> <ID>
-- worker connesso <Port> <ID> <SeedAddress> <SeedPort> <SeedId>
-- client <WorkerAddress> <WorkerPort> <WorkerID>
+- worker indipendente "Port" "ID"
+- worker connesso "Port" "ID" "SeedAddress" "SeedPort" "SeedId"
+- client "WorkerAddress" "WorkerPort" "WorkerID"
 
 Nell'implementazione corrente ogni worker se sullo stesso dispositivo deve essere associato a una porta differente.
