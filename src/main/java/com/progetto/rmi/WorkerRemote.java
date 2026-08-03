@@ -18,6 +18,5 @@ public interface WorkerRemote extends Remote {
 
     //Methods for a worker to register when it connects to the net
     void registerPeer(String peerId, WorkerRemote peerStub) throws RemoteException;
-    void unregisterPeer(String peerId) throws RemoteException;
     Map<String, WorkerRemote> getKnownPeers() throws RemoteException;
 }
