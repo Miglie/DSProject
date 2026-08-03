@@ -7,10 +7,6 @@ import java.io.Serializable;
  * any change (load, heartbeat) produces a new instance with a higher
  * version — that version is what ClusterState.merge() compares to decide
  * whether an incoming view is newer than what it already has.
- *
- * No host/port here: peer identity and connectivity are already handled by
- * the dynamic join protocol (Worker.peers holds live WorkerRemote stubs
- * keyed by workerId), so gossip only needs to carry load information.
  */
 public final class WorkerView implements Serializable {
 

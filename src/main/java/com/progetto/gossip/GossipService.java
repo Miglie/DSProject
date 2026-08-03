@@ -13,6 +13,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 /**
  * Owns load-balancing state for one worker: its own versioned load and the
@@ -31,10 +32,11 @@ public class GossipService {
     private final String workerId;
     private final ConcurrentHashMap<String, WorkerRemote> peers;
     private final ClusterState clusterState = new ClusterState();
+    /** peerId -> jobs forwarded to it that are still in flight; */
+    private final ConcurrentHashMap<String, Integer> pendingForwards = new ConcurrentHashMap<>();
     private final Random random = new Random();
     private final ScheduledExecutorService scheduler;
 
-    // Only ever touched inside the synchronized recordLocalLoadChange(), so plain fields suffice.
     private long versionCounter = 0;
     private int localLoad = 0;
 
@@ -64,27 +66,33 @@ public class GossipService {
         clusterState.merge(current.withLoad(localLoad, versionCounter));
     }
 
-    /** Returns a peer to forward to if it's significantly less loaded than us, else null (run locally). */
-    public String decideForwardTarget() {
-        // Filtered directly against `peers` (not just excluding self): ClusterState can carry a
-        // "ghost" entry for a worker we've locally evicted but a third peer still gossips about —
-        // picking the least-loaded among only currently-known peers avoids getting stuck offering
-        // an unreachable candidate instead of falling through to the next-best real one.
-        String candidateId = clusterState.allViews().stream()
+    /**
+     * Picks a peer to forward to if it is significantly less loaded than this worker and reserves
+     * a slot on it, or returns null to run the job locally.
+     */
+    public synchronized String reserveForwardTarget() {
+        WorkerView self = clusterState.get(workerId);
+        String target = clusterState.allViews().stream()
                 .filter(v -> !v.getWorkerId().equals(workerId))
                 .filter(v -> peers.containsKey(v.getWorkerId()))
-                .min(Comparator.comparingInt(WorkerView::getLoadCount))
+                .min(Comparator.comparingInt(this::effectiveLoad))
+                .filter(candidate -> self.getLoadCount() - effectiveLoad(candidate) > LOAD_IMBALANCE_THRESHOLD)
                 .map(WorkerView::getWorkerId)
                 .orElse(null);
-        if (candidateId == null) {
-            return null;
+        if (target != null) {
+            pendingForwards.merge(target, 1, Integer::sum);
         }
-        WorkerView self = clusterState.get(workerId);
-        WorkerView candidate = clusterState.get(candidateId);
-        if (self.getLoadCount() - candidate.getLoadCount() > LOAD_IMBALANCE_THRESHOLD) {
-            return candidateId;
-        }
-        return null;
+        return target;
+    }
+
+    /** Releases a slot once the forward has settled. */
+    public void releaseForwardSlot(String peerId) {
+        pendingForwards.computeIfPresent(peerId, (id, count) -> count == 1 ? null : count - 1);
+    }
+
+    /** A peer's gossiped load plus the jobs we've sent it that it hasn't gossiped back to us yet. */
+    private int effectiveLoad(WorkerView view) {
+        return view.getLoadCount() + pendingForwards.getOrDefault(view.getWorkerId(), 0);
     }
 
     public ClusterState exchangeState(ClusterState callerState) {
@@ -95,6 +103,7 @@ public class GossipService {
     /** Drops a peer from the gossiped load view, e.g. after evicting it from membership on RPC failure. */
     public void forgetPeer(String peerId) {
         clusterState.remove(peerId);
+        pendingForwards.remove(peerId);
     }
 
     private void gossipRound() {
@@ -118,15 +127,15 @@ public class GossipService {
             log("round with " + target + " FAILED: " + e.getMessage() + " -- evicting peer");
             peers.remove(target);
             forgetPeer(target);
+        } catch (RuntimeException e) {
+            log("round with " + target + " raised " + e);
         }
     }
 
     private String describeCluster() {
-        StringBuilder sb = new StringBuilder();
-        clusterState.allViews().forEach(v ->
-                sb.append(v.getWorkerId()).append("(load=").append(v.getLoadCount())
-                        .append(",v=").append(v.getVersion()).append(") "));
-        return sb.toString().trim();
+        return clusterState.allViews().stream()
+                .map(v -> v.getWorkerId() + "(load=" + v.getLoadCount() + ",v=" + v.getVersion() + ")")
+                .collect(Collectors.joining(" "));
     }
 
     private void log(String message) {

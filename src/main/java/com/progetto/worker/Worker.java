@@ -19,34 +19,32 @@ import java.rmi.server.UnicastRemoteObject;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
 
 public class Worker implements WorkerRemote, GossipRemote {
 
-    private static final long serialVersionUID = 1L;
+    /** How often the origin re-asks a peer for the result of a job it forwarded. */
+    private static final long FORWARD_POLL_INTERVAL_MS = 200;
 
     /**
-     * A forwarded job's forwardJob() call blocks until the receiving worker
-     * finishes executing it, so this must stay comfortably under the RMI
-     * response timeout configured in start() (15s) or the caller will see a
-     * transport timeout instead of a real result.
+     * Consecutive failed polls before the origin gives up on a peer that had already accepted a
+     * job. Tolerating a few keeps a momentary hiccup from triggering a duplicate local re-run of
+     * a job the peer is still perfectly happily executing.
      */
-    private static final long FORWARD_WAIT_TIMEOUT_SECONDS = 12;
+    private static final int MAX_CONSECUTIVE_POLL_FAILURES = 3;
 
     private final String workerId;
     private final BlockingQueue<Job> queue = new LinkedBlockingQueue<>();
     private final ConcurrentHashMap<String, Job> jobs = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, JobResult> results = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, WorkerRemote> peers = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, CompletableFuture<JobResult>> completions = new ConcurrentHashMap<>();
     private final GossipService gossipService;
     private final ExecutorService forwardingExecutor = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "worker-forward");
@@ -70,7 +68,7 @@ public class Worker implements WorkerRemote, GossipRemote {
         Job job = new Job(task);
         jobs.put(job.getJobId(), job);
 
-        String target = gossipService.decideForwardTarget();
+        String target = gossipService.reserveForwardTarget();
         if (target != null) {
             job.setStatus(JobStatus.RUNNING);
             log(job, "FORWARDING to peer " + target + " (load balancing)");
@@ -107,19 +105,11 @@ public class Worker implements WorkerRemote, GossipRemote {
     public void registerPeer(String peerId, WorkerRemote peerStub) throws RemoteException{
         //Avoid registering itself
         if (peerId.equals(this.workerId)) return;
-        // putIfAbsent instead of containsKey+put: the previous check-then-act was not atomic,
+        // putIfAbsent instead of containsKey+put to guarantee atomicity,
         // so two concurrent joins for the same peerId could both pass the check and double-log.
         if (peers.putIfAbsent(peerId, peerStub) == null) {
             //Debugging print
             networkLog(peerId, "added");
-        }
-    }
-
-    /*TODO: Capire se questa funzione serve...al massimo per uscire gracefully */
-    @Override
-    public void unregisterPeer(String peerId) throws RemoteException {
-        if (peers.remove(peerId) != null) {
-            networkLog(peerId, "removed");
         }
     }
 
@@ -135,23 +125,13 @@ public class Worker implements WorkerRemote, GossipRemote {
     }
 
     @Override
-    public JobResult forwardJob(Job job) throws RemoteException {
+    public void forwardJob(Job job) throws RemoteException {
         log(job, "RECEIVED forwarded job from peer");
         enqueueLocally(job);
-        try {
-            return completions.get(job.getJobId()).get(FORWARD_WAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new RemoteException("Interrupted while executing forwarded job " + job.getJobId(), e);
-        } catch (Exception e) {
-            throw new RemoteException("Error executing forwarded job " + job.getJobId(), e);
-        }
     }
 
-    /** Enqueues a job for local execution — shared by directly-submitted and forwarded-in jobs. */
     private void enqueueLocally(Job job) throws RemoteException {
         jobs.putIfAbsent(job.getJobId(), job);
-        completions.putIfAbsent(job.getJobId(), new CompletableFuture<>());
         gossipService.recordLocalLoadChange(1);
         log(job, "QUEUED locally");
         try {
@@ -162,47 +142,59 @@ public class Worker implements WorkerRemote, GossipRemote {
         }
     }
 
-    /** Sends a job to a peer and, on success, records the result as if this worker had run it. */
+    /**
+     * Hands a job to a peer, waits for the peer's result and records it as if this worker had run
+     * it — the client only ever talks to the worker it submitted to.
+     */
     private void forwardToPeer(Job job, String peerId) {
         try {
             WorkerRemote stub = peers.get(peerId);
             if (stub == null) {
                 throw new RemoteException("Peer " + peerId + " is no longer known");
             }
-            JobResult result = ((GossipRemote) stub).forwardJob(job);
-            job.setStatus(result.isSuccess() ? JobStatus.COMPLETED : JobStatus.FAILED);
-            results.put(job.getJobId(), result);
+            ((GossipRemote) stub).forwardJob(job);
+            JobResult result = awaitRemoteResult(stub, job.getJobId(), peerId);
+            publishResult(job, result);
             log(job, "FORWARD to " + peerId + " completed -> output=" + result.getOutput());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log(job, "FORWARD to " + peerId + " ABANDONED (worker shutting down)");
         } catch (Exception e) {
-            // A timeout means the peer is busy (its own queue hadn't drained in time), not dead —
-            // evicting it here would be permanent (nothing currently re-adds a peer to `peers`),
-            // so a single overloaded moment would exclude it from load balancing forever. Only
-            // evict on failures that actually indicate unreachability (e.g. connection refused).
-            if (isTimeout(e)) {
-                log(job, "FORWARD to " + peerId + " TIMED OUT (peer busy), executing locally instead");
-            } else {
-                log(job, "FORWARD to " + peerId + " FAILED (" + e.getMessage() + "), evicting peer and executing locally instead");
-                peers.remove(peerId);
-                gossipService.forgetPeer(peerId);
-            }
+            log(job, "FORWARD to " + peerId + " FAILED (" + e.getMessage() + "), evicting peer and executing locally instead");
+            peers.remove(peerId);
+            gossipService.forgetPeer(peerId);
             try {
                 enqueueLocally(job);
             } catch (RemoteException re) {
-                job.setStatus(JobStatus.FAILED);
-                results.put(job.getJobId(), new JobResult(job.getJobId(), null, false,
+                publishResult(job, new JobResult(job.getJobId(), null, false,
                         "Forward failed and local fallback failed: " + re.getMessage()));
                 log(job, "FALLBACK FAILED: " + re.getMessage());
             }
+        } finally {
+            gossipService.releaseForwardSlot(peerId);
         }
     }
 
-    private static boolean isTimeout(Throwable t) {
-        for (Throwable cause = t; cause != null; cause = cause.getCause()) {
-            if (cause instanceof java.util.concurrent.TimeoutException) {
-                return true;
+  
+    private JobResult awaitRemoteResult(WorkerRemote stub, String jobId, String peerId)
+            throws RemoteException, InterruptedException {
+        int consecutiveFailures = 0;
+        while (true) {
+            try {
+                return stub.getResult(jobId);
+            } catch (JobNotCompletedException e) {
+                consecutiveFailures = 0;
+            } catch (JobNotFoundException e) {
+                // The peer accepted the job and then forgot it — it restarted, so nobody is
+                // running it and the origin has to.
+                throw new RemoteException("Peer " + peerId + " lost forwarded job " + jobId, e);
+            } catch (RemoteException e) {
+                if (++consecutiveFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
+                    throw e;
+                }
             }
+            Thread.sleep(FORWARD_POLL_INTERVAL_MS);
         }
-        return false;
     }
 
     private void processLoop() {
@@ -222,21 +214,21 @@ public class Worker implements WorkerRemote, GossipRemote {
         log(job, "RUNNING");
         JobResult result;
         try {
-            Object output = runTask(job.getTask());
-            job.setStatus(JobStatus.COMPLETED);
-            result = new JobResult(job.getJobId(), output, true, null);
-            log(job, "COMPLETED -> output=" + output);
+            result = new JobResult(job.getJobId(), runTask(job.getTask()), true, null);
         } catch (Exception e) {
-            job.setStatus(JobStatus.FAILED);
             result = new JobResult(job.getJobId(), null, false, e.getMessage());
-            log(job, "FAILED -> error=" + e.getMessage());
         }
-        results.put(job.getJobId(), result);
+        publishResult(job, result);
+        log(job, result.isSuccess()
+                ? "COMPLETED -> output=" + result.getOutput()
+                : "FAILED -> error=" + result.getErrorMessage());
+
         gossipService.recordLocalLoadChange(-1);
-        CompletableFuture<JobResult> future = completions.get(job.getJobId());
-        if (future != null) {
-            future.complete(result);
-        }
+    }
+
+    private void publishResult(Job job, JobResult result) {
+        results.put(job.getJobId(), result);
+        job.setStatus(result.isSuccess() ? JobStatus.COMPLETED : JobStatus.FAILED);
     }
 
     @SuppressWarnings("unchecked")
@@ -308,10 +300,11 @@ public class Worker implements WorkerRemote, GossipRemote {
     }
 
     public static Worker start(String workerId, int port) throws RemoteException {
-        // Default RMI response timeout is effectively unbounded. 15s (not Step 1's 5s) because
-        // forwardJob() now blocks for the full duration of a forwarded job's execution — the
-        // timeout must exceed the longest expected job runtime.
-        System.setProperty("sun.rmi.transport.tcp.responseTimeout", "15000");
+        // Default RMI response timeout is effectively unbounded. No call blocks for the duration
+        // of a job any more (forwardJob() only enqueues, and the origin polls for the result), so
+        // every call is expected to return promptly and this only has to be generous enough to
+        // ride out a loaded-but-alive peer.
+        System.setProperty("sun.rmi.transport.tcp.responseTimeout", "10000");
 
         Worker worker = new Worker(workerId);
         WorkerRemote stub = (WorkerRemote) UnicastRemoteObject.exportObject(worker, 0);
@@ -342,20 +335,17 @@ public class Worker implements WorkerRemote, GossipRemote {
                     this.peers.put(entry.getKey(), entry.getValue());
                 }
             }
-            //Contacting all remote peers acquired to perform handshake
-            List<String> failedPeers = new ArrayList<>();
-            for(Map.Entry<String, WorkerRemote> entry : this.peers.entrySet()){
+            //Contacting all remote peers acquired to perform handshake, dropping the unreachable ones
+            Iterator<Map.Entry<String, WorkerRemote>> it = this.peers.entrySet().iterator();
+            while (it.hasNext()) {
+                Map.Entry<String, WorkerRemote> entry = it.next();
                 try{
                     entry.getValue().registerPeer(this.workerId, this.selfStub);
                     networkLog(entry.getKey(), "handshake completed with");
                 } catch (RemoteException e){
                     System.err.println("Failed to register to remote worker " + entry.getKey() + ": " + e.getMessage());
-                    failedPeers.add(entry.getKey());
+                    it.remove();
                 }
-            }
-
-            for(String deadPeer : failedPeers) {
-                this.peers.remove(deadPeer);
             }
         }
         catch (NotBoundException e){
@@ -373,22 +363,14 @@ public class Worker implements WorkerRemote, GossipRemote {
             System.exit(1);
         }
 
-        int port = parsePort(args[0]);
-        String workerId = args[1];
-        Worker worker = null;
-
         try {
-            worker = start(workerId, port);
+            Worker worker = start(args[1], parsePort(args[0]));
+            if (args.length == 5) {
+                worker.joinNetwork(args[2], parsePort(args[3]), args[4]);
+            }
         } catch (RemoteException e) {
             System.err.println("Failed to start worker RMI server: " + e.getMessage());
             System.exit(1);
-        }
-
-        if (args.length > 2) {
-            String targetHost = args[2];
-            int targetPort = parsePort(args[3]);
-            String targetId = args[4];
-            worker.joinNetwork(targetHost, targetPort, targetId);
         }
     }
 

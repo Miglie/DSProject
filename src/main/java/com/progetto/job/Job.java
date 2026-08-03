@@ -3,10 +3,7 @@ package com.progetto.job;
 import java.io.Serializable;
 import java.util.UUID;
 
-/**
- * Wraps a {@link Task} with the bookkeeping fields a worker needs to track
- * its execution: identity, current status and when it last changed.
- */
+
 public class Job implements Serializable {
 
     private static final long serialVersionUID = 1L;
