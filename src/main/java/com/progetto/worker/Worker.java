@@ -51,7 +51,6 @@ public class Worker implements WorkerRemote, GossipRemote {
         t.setDaemon(true);
         return t;
     });
-
     private WorkerRemote selfStub; //stub of local worker to send to the other nodes
 
     public Worker(String workerId) {
@@ -63,6 +62,9 @@ public class Worker implements WorkerRemote, GossipRemote {
         executorThread.start();
     }
 
+    /** A task is submitted by the client. Gossip service is queried to choose if forward to peer or execute locally.
+     * The task is wrapped into a Job and then returned to the client.
+     */
     @Override
     public Job submitJob(Task task) throws RemoteException {
         Job job = new Job(task);
@@ -79,6 +81,7 @@ public class Worker implements WorkerRemote, GossipRemote {
         return job;
     }
 
+    /** Client queries the status of a job. */
     @Override
     public JobStatus getStatus(String jobId) throws RemoteException, JobNotFoundException {
         Job job = jobs.get(jobId);
@@ -88,6 +91,7 @@ public class Worker implements WorkerRemote, GossipRemote {
         return job.getStatus();
     }
 
+    /**  */
     @Override
     public JobResult getResult(String jobId) throws RemoteException, JobNotFoundException, JobNotCompletedException {
         Job job = jobs.get(jobId);
@@ -124,6 +128,7 @@ public class Worker implements WorkerRemote, GossipRemote {
         return gossipService.exchangeState(callerState);
     }
 
+    /** Called on a stub to forward a job. Job gets enqueued locally by the receiver.*/
     @Override
     public void forwardJob(Job job) throws RemoteException {
         log(job, "RECEIVED forwarded job from peer");
