@@ -45,6 +45,11 @@ public final class WorkerView implements Serializable {
         return new WorkerView(workerId, newLoadCount, newVersion, System.currentTimeMillis());
     }
 
+    /**Creates a new view with the current timestamp */
+    public WorkerView timestamp() {
+        return new WorkerView(workerId, loadCount, version, System.currentTimeMillis());
+    }
+
     @Override
     public String toString() {
         return "WorkerView{id='" + workerId + "', load=" + loadCount + ", v=" + version + '}';

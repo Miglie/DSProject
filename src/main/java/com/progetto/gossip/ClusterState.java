@@ -4,6 +4,8 @@ import java.io.Serializable;
 import java.util.Collection;
 import java.util.concurrent.ConcurrentHashMap;
 
+import com.progetto.rmi.WorkerRemote;
+
 /**
  * Thread-safe, gossip-mergeable view of the cluster's load. Passed by value
  * over RMI during push-pull exchanges (Serializable), and merged with
@@ -19,11 +21,20 @@ public class ClusterState implements Serializable {
     /** Applies incoming only if strictly newer than what's already known for that workerId. */
     public void merge(WorkerView incoming) {
         views.compute(incoming.getWorkerId(), (id, existing) ->
-                (existing == null || incoming.getVersion() > existing.getVersion()) ? incoming : existing);
+                (existing == null || incoming.getVersion() > existing.getVersion()) ? incoming.timestamp() : existing);
     }
 
-    public void mergeAll(ClusterState incoming) {
-        incoming.views.values().forEach(this::merge);
+    /**Merges a full view sent by a remote peer into the local view. Employs a filter against the list of known peers
+     * to avoid registering again into the clusterState precedently evicted nodes.
+     */
+    //TODO:è necessario leggere anche la propria View da remoto? Come può aiutarci questo nella crash resiliency?
+    public void mergeAll(ClusterState incoming, String selfWorkerId, ConcurrentHashMap<String, WorkerRemote> peers) {
+        incoming.views.values().forEach(v -> {
+            String id = v.getWorkerId();
+            if(id.equals(selfWorkerId) || peers.containsKey(id)){
+                merge(v);
+            }
+        });
     }
 
     /** Defensive copy, safe to hand out over RMI or iterate without exposing the live map. */

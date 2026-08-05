@@ -91,7 +91,6 @@ public class Worker implements WorkerRemote, GossipRemote {
         return job.getStatus();
     }
 
-    /**  */
     @Override
     public JobResult getResult(String jobId) throws RemoteException, JobNotFoundException, JobNotCompletedException {
         Job job = jobs.get(jobId);
@@ -105,6 +104,7 @@ public class Worker implements WorkerRemote, GossipRemote {
         return result;
     }
 
+    /** Register a new peer in both the peers view and the clusterState view */
     @Override
     public void registerPeer(String peerId, WorkerRemote peerStub) throws RemoteException{
         //Avoid registering itself
@@ -123,6 +123,7 @@ public class Worker implements WorkerRemote, GossipRemote {
         return new HashMap<>(this.peers);
     }
 
+    /** Called inside GossipService, exchanges state info between peers */
     @Override
     public ClusterState exchangeState(ClusterState callerState) throws RemoteException {
         return gossipService.exchangeState(callerState);
@@ -135,6 +136,7 @@ public class Worker implements WorkerRemote, GossipRemote {
         enqueueLocally(job);
     }
 
+    /**Enqueue a job for local execution, updating local state. */
     private void enqueueLocally(Job job) throws RemoteException {
         jobs.putIfAbsent(job.getJobId(), job);
         gossipService.recordLocalLoadChange(1);
@@ -166,6 +168,7 @@ public class Worker implements WorkerRemote, GossipRemote {
             log(job, "FORWARD to " + peerId + " ABANDONED (worker shutting down)");
         } catch (Exception e) {
             log(job, "FORWARD to " + peerId + " FAILED (" + e.getMessage() + "), evicting peer and executing locally instead");
+            //TODO: è sufficiente per beccare i crash?
             peers.remove(peerId);
             gossipService.forgetPeer(peerId);
             try {
@@ -180,7 +183,7 @@ public class Worker implements WorkerRemote, GossipRemote {
         }
     }
 
-  
+    /**Polls the remote stub to get result of a job handled by a peer. Only fails <= treshold are tolerated.*/
     private JobResult awaitRemoteResult(WorkerRemote stub, String jobId, String peerId)
             throws RemoteException, InterruptedException {
         int consecutiveFailures = 0;
@@ -231,6 +234,7 @@ public class Worker implements WorkerRemote, GossipRemote {
         gossipService.recordLocalLoadChange(-1);
     }
 
+    /**Result of a completed job is added to the worker state.*/
     private void publishResult(Job job, JobResult result) {
         results.put(job.getJobId(), result);
         job.setStatus(result.isSuccess() ? JobStatus.COMPLETED : JobStatus.FAILED);
@@ -340,6 +344,9 @@ public class Worker implements WorkerRemote, GossipRemote {
                     this.peers.put(entry.getKey(), entry.getValue());
                 }
             }
+
+            gossipService.bootstrap((GossipRemote) targetPeer, targetWorkerId);
+
             //Contacting all remote peers acquired to perform handshake, dropping the unreachable ones
             Iterator<Map.Entry<String, WorkerRemote>> it = this.peers.entrySet().iterator();
             while (it.hasNext()) {
@@ -349,6 +356,7 @@ public class Worker implements WorkerRemote, GossipRemote {
                     networkLog(entry.getKey(), "handshake completed with");
                 } catch (RemoteException e){
                     System.err.println("Failed to register to remote worker " + entry.getKey() + ": " + e.getMessage());
+                    gossipService.forgetPeer(entry.getKey());
                     it.remove();
                 }
             }
@@ -389,3 +397,8 @@ public class Worker implements WorkerRemote, GossipRemote {
         }
     }
 }
+
+//TODO: Heartbeat (con ts?) da implementare bene FATTO
+//TODO: Controllare crash detection FATTO
+//TODO: Log su disco
+//TODO: Ripresa processo crashato tenendo il tutto coerente
