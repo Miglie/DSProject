@@ -17,8 +17,12 @@ Infrastruttura per gestire job inviati a un cluster di worker, con join dinamico
 3. **Load balancing**: quando arriva un nuovo job, il worker controlla se un peer noto ha un carico significativamente più basso del proprio (soglia: differenza > 2). Se sì, il job viene inoltrato in background e il client continua a interrogare **solo** il worker a cui si è connesso all'inizio — mai il worker che lo esegue realmente. Ogni forwarding *prenota* subito uno slot sul peer scelto: dato che il gossip aggiorna il carico solo ogni 2s, senza la prenotazione tutti i job di una raffica vedrebbero la stessa foto "quel peer è scarico" e finirebbero tutti sullo stesso nodo.
 4. **Forwarding ack-then-poll**: `forwardJob` ritorna appena il job è in coda sul peer — ritornare senza errore significa "il peer ha preso in carico il job". Da quel momento il nodo d'origine fa polling di `getResult` sul peer finché il risultato non è pronto, e **non** lo riesegue: un peer lento viene semplicemente atteso. Se `forwardJob` bloccasse per tutta la durata del job, un peer occupato sarebbe indistinguibile da uno morto e il job verrebbe eseguito due volte.
 5. **Resilienza minima**: un peer viene rimosso dalla lista dei peer e dal cluster state solo quando è davvero irraggiungibile (connection refused, o più poll falliti di fila). Solo in quel caso il job torna in esecuzione locale — quindi il forwarding è *exactly-once* nel caso normale e *at-least-once* se un peer muore mentre teneva il job.
+6. **Failure detection disaccoppiata**: il controllo dei guasti opera in modo passivo e indipendente dall'I/O di rete per evitare che ritardi o blocchi di rete congelino l'intero ciclo di controllo:
+   - **Architettura non bloccante**: lo `scheduler` principale del gossip gira su un unico thread dedicato. Le chiamate RMI uscenti (`exchangeState`) vengono inoltrate in modo asincrono a un pool di thread I/O (`gossipExecutor`).
+   - **Failure Detection passiva**: ad ogni round di 2 secondi, `detectPeerFailure()` verifica l'anzianità dei timestamp di heartbeat nel `ClusterState`. Se un peer non aggiorna il proprio stato da oltre `CRASHED_WORKER_TRESHOLD_MS` (6000 ms), viene espulso da `peers` senza bloccare i cicli di gossip tra i nodi superstiti.
+   - **Isolamento della partizione**: se un nodo rimane isolato, rimuove i peer scaduti dal proprio stato e interrompe le chiamate RMI verso endpoint non più raggiungibili.
 
-Non ancora implementato: vera crash detection (heartbeat con timeout), stable storage su disco, recovery dopo crash.
+Non ancora implementato: stable storage su disco, recovery dopo crash.
 
 ## Come compilare
 
@@ -76,6 +80,15 @@ Nei log dei worker cerca:
 - `FORWARD to worker-X FAILED (...), evicting peer` — il peer è risultato irraggiungibile: viene espulso e il job rieseguito localmente
 
 Con un cluster di 3 nodi e `Client ... stress 10 3000` i 10 job si distribuiscono su tutti e tre i worker (es. 5/3/2) e ognuno viene eseguito **una volta sola**: se un `job=<id>` compare con `:: RUNNING` su due worker diversi senza che nessuno sia stato ucciso, è un bug.
+
+### Test della Failure Detection (Freeze con SIGSTOP)
+
+È possibile testare la reattività della Failure Detection simulando il congelamento/blocco di un worker senza chiudere la sua socket TCP:
+
+1. Avvia un cluster di 3 worker (`worker-1` su porta 1099, `worker-2` su 1100, `worker-3` su 1101).
+2. Congela `worker-3` eseguendo da un altro terminale:
+   ```bash
+   kill -STOP $(pgrep -f "worker-3")
 
 ## Parametri CLI
 
