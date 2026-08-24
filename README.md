@@ -5,10 +5,11 @@ Infrastruttura per gestire job inviati a un cluster di worker, con join dinamico
 ## Architettura
 
 - `com.progetto.job` — modello dati: `Task` (lavoro grezzo: `type` + `payload`), `Job` (Task + jobId + stato), `JobStatus` (`PENDING`/`RUNNING`/`COMPLETED`/`FAILED`), `JobResult`.
-- `com.progetto.rmi` — interfacce remote: `WorkerRemote` (API client-facing: `submitJob`/`getStatus`/`getResult`, più le API di membership `registerPeer`/`unregisterPeer`/`getKnownPeers`) e `GossipRemote` (API worker-to-worker: `exchangeState`/`forwardJob`). `forwardJob` è un ack non bloccante: il risultato di un job inoltrato viene poi recuperato dal nodo d'origine via `getResult`.
+- `com.progetto.rmi` — interfacce remote: `WorkerRemote` (API client-facing: `submitJob`/`getStatus`/`getResult`, più le API di membership `registerPeer`/`getKnownPeers`) e `GossipRemote` (API worker-to-worker: `exchangeState`/`forwardJob`). `forwardJob` è un ack non bloccante: il risultato di un job inoltrato viene poi recuperato dal nodo d'origine via `getResult`. `exchangeState` porta anche id e stub del chiamante, così ogni round di gossip vale come annuncio di membership.
 - `com.progetto.gossip` — `WorkerView` (snapshot versionato del carico di un worker), `ClusterState` (mappa mergeable workerId → WorkerView, ultimo scrivente vince per versione), `GossipService` (round di gossip periodico e decisione di forwarding).
 - `com.progetto.worker` — `Worker`: implementa sia `WorkerRemote` che `GossipRemote` sullo stesso oggetto esportato/bindato.
 - `com.progetto.client` — `Client`, in due modalità: *demo* (un job per tipo) e *stress* (un burst di job per generare squilibrio di carico e osservare il forwarding).
+- `src/test/java` — suite JUnit 5 che rispecchia i package sopra; vedi [Test automatici](#test-automatici).
 
 ### Come funziona
 
@@ -16,13 +17,19 @@ Infrastruttura per gestire job inviati a un cluster di worker, con join dinamico
 2. **Gossip del carico**: ogni worker, ogni 2 secondi, sceglie un peer a caso tra quelli conosciuti e scambia il proprio `ClusterState` (push-pull in una chiamata RMI). Ogni voce del cluster porta un contatore di versione: chi ha la versione più alta vince il merge.
 3. **Load balancing**: quando arriva un nuovo job, il worker controlla se un peer noto ha un carico significativamente più basso del proprio (soglia: differenza > 2). Se sì, il job viene inoltrato in background e il client continua a interrogare **solo** il worker a cui si è connesso all'inizio — mai il worker che lo esegue realmente. Ogni forwarding *prenota* subito uno slot sul peer scelto: dato che il gossip aggiorna il carico solo ogni 2s, senza la prenotazione tutti i job di una raffica vedrebbero la stessa foto "quel peer è scarico" e finirebbero tutti sullo stesso nodo.
 4. **Forwarding ack-then-poll**: `forwardJob` ritorna appena il job è in coda sul peer — ritornare senza errore significa "il peer ha preso in carico il job". Da quel momento il nodo d'origine fa polling di `getResult` sul peer finché il risultato non è pronto, e **non** lo riesegue: un peer lento viene semplicemente atteso. Se `forwardJob` bloccasse per tutta la durata del job, un peer occupato sarebbe indistinguibile da uno morto e il job verrebbe eseguito due volte.
-5. **Resilienza minima**: un peer viene rimosso dalla lista dei peer e dal cluster state solo quando è davvero irraggiungibile (connection refused, o più poll falliti di fila). Solo in quel caso il job torna in esecuzione locale — quindi il forwarding è *exactly-once* nel caso normale e *at-least-once* se un peer muore mentre teneva il job.
+5. **Resilienza minima**: un peer viene rimosso dalla lista dei peer e dal cluster state quando risulta irraggiungibile (connection refused, poll falliti di fila, o heartbeat scaduto). Solo in quel caso il job torna in esecuzione locale. L'espulsione non è definitiva (punto 6) e la semantica di esecuzione che ne risulta è discussa al punto 7.
 6. **Failure detection disaccoppiata**: il controllo dei guasti opera in modo passivo e indipendente dall'I/O di rete per evitare che ritardi o blocchi di rete congelino l'intero ciclo di controllo:
    - **Architettura non bloccante**: lo `scheduler` principale del gossip gira su un unico thread dedicato. Le chiamate RMI uscenti (`exchangeState`) vengono inoltrate in modo asincrono a un pool di thread I/O (`gossipExecutor`).
-   - **Failure Detection passiva**: ad ogni round di 2 secondi, `detectPeerFailure()` verifica l'anzianità dei timestamp di heartbeat nel `ClusterState`. Se un peer non aggiorna il proprio stato da oltre `CRASHED_WORKER_TRESHOLD_MS` (6000 ms), viene espulso da `peers` senza bloccare i cicli di gossip tra i nodi superstiti.
-   - **Isolamento della partizione**: se un nodo rimane isolato, rimuove i peer scaduti dal proprio stato e interrompe le chiamate RMI verso endpoint non più raggiungibili.
+   - **Failure Detection passiva**: ad ogni round di 2 secondi, `detectPeerFailure()` verifica l'anzianità dei timestamp di heartbeat nel `ClusterState`. Se un peer non aggiorna il proprio stato da oltre `CRASHED_WORKER_THRESHOLD_MS` (6000 ms), viene espulso da `peers` senza bloccare i cicli di gossip tra i nodi superstiti.
+   - **Ri-ammissione (anti-entropy sulla membership)**: la failure detection può solo *togliere* peer, quindi serve un percorso simmetrico per rimetterli. Ogni `exchangeState` porta id e stub del chiamante, e il ricevente lo ri-registra: un nodo che era solo rallentato rientra da solo al primo round utile, senza protocolli aggiuntivi. Senza questo, chi veniva espulso per un blocco temporaneo spariva per sempre e il cluster restava spaccato.
+   - **Rilevamento dello stallo locale**: se un round arriva con più di `SCHEDULER_STALL_THRESHOLD_MS` di ritardo, il blocco eravamo noi (JVM congelata, GC lungo, SIGSTOP): tutti gli heartbeat sembrano vecchi per colpa nostra. In quel round la failure detection viene saltata e i timestamp vengono rinfrescati in blocco, altrimenti il nodo appena risvegliato espellerebbe l'intero cluster in un colpo solo.
+   - **Restart con lo stesso id**: `registerPeer` sostituisce sempre lo stub (un processo riavviato è esportato su una porta anonima diversa, quello vecchio è morto), e il version counter viene rialzato sopra la versione che i peer conservano di noi — altrimenti dopo un riavvio ogni nostro aggiornamento perderebbe il confronto last-writer-wins e il nostro carico resterebbe congelato al valore pre-crash.
+7. **Semantica di esecuzione — at-least-once, e perché non può essere exactly-once**: il fallback locale scatta quando il peer è *irraggiungibile*, cioè esattamente nella situazione in cui non si può distinguere "è morto" da "è lento o partizionato ma sta eseguendo il job". Senza un servizio di coordinamento esterno (lease, fencing token) l'exactly-once attraverso una partizione non è ottenibile: è un limite teorico, non una mancanza di questa implementazione. Il sistema garantisce quindi **at-least-once**, e tre proprietà lo rendono innocuo:
+   - **Assunzione sui task**: i task sono deterministici e privi di effetti collaterali — `SUM`, `SLEEP` e `MATRIX_MULT` lo sono. Sotto questa assunzione una doppia esecuzione spreca CPU ma è *osservazionalmente equivalente* all'exactly-once, perché produce lo stesso risultato. Task con effetti collaterali violerebbero l'assunzione e dovrebbero farsi carico da soli dell'idempotenza.
+   - **Risposta univoca al client**: il nodo d'origine pubblica una sola `JobResult` per job — quella del peer se il polling è riuscito, altrimenti quella della propria riesecuzione. Il risultato calcolato da un peer che torna in vita resta nella sua mappa locale e non viene letto da nessuno. Il client non vede mai due risposte né una risposta incoerente.
+   - **Deduplica locale**: ogni worker tiene traccia dei jobId che ha accettato per l'esecuzione locale (`locallyAccepted`) e ignora una seconda consegna dello stesso job. Chiude il caso "stesso job accodato due volte sullo stesso nodo"; non chiude — e non può chiudere — quello di due nodi diversi che lo eseguono entrambi. Il marcatore è volutamente distinto dalla mappa `jobs`: su chi ha inoltrato un job quella mappa lo contiene già pur non avendolo mai accodato, quindi usarla come guardia sopprimerebbe proprio il fallback locale.
 
-Non ancora implementato: stable storage su disco, recovery dopo crash.
+Non ancora implementato: stable storage su disco, recovery dei job in coda dopo un crash, e cancellazione best-effort sul peer prima del fallback locale — quest'ultima restringerebbe (senza chiuderla) la finestra di doppia esecuzione descritta al punto 7.
 
 ## Come compilare
 
@@ -47,7 +54,66 @@ java -cp target/classes com.progetto.worker.Worker 1101 worker-3 localhost 1099 
 
 Ogni worker stampa su console gli handshake di join e, ogni 2s, i round di gossip (`[gossip=worker-X] round -> ... / round <- ...`) — utile per verificare a occhio che il cluster converga.
 
-## Come testare
+## Test automatici
+
+```bash
+mvn test
+```
+
+42 test JUnit 5, nessuna rete e nessun registry RMI coinvolti: girano in pochi secondi.
+
+### Setup
+
+I test usano **JUnit 5** (Jupiter). Il `pom.xml` dichiara due sole cose:
+
+```xml
+<dependency>
+    <groupId>org.junit.jupiter</groupId>
+    <artifactId>junit-jupiter</artifactId>
+    <version>5.10.2</version>
+    <scope>test</scope>
+</dependency>
+```
+
+l'artefatto aggregatore (tira dentro `junit-jupiter-api`, `-params` e `-engine`, quindi non serve altro), e il **Surefire 3.2.5**, necessario perché le versioni precedenti non sanno lanciare la piattaforma JUnit 5. È configurato con `redirectTestOutputToFile`: worker e gossip loggano parecchio su stdout, e senza quello un `mvn test` sommerge il risultato sotto migliaia di righe. L'output resta comunque disponibile per classe sotto `target/surefire-reports/*-output.txt` quando serve indagare un fallimento.
+
+La prima esecuzione scarica le dipendenze, quindi richiede rete; dopo funziona anche offline (`mvn -o test`).
+
+### Layout
+
+I test stanno in `src/test/java` e rispecchiano i package del codice, così hanno accesso ai membri package-private che fanno da giunto di test:
+
+```
+src/test/java/com/progetto/gossip/ClusterStateTest.java
+src/test/java/com/progetto/gossip/GossipServiceTest.java
+src/test/java/com/progetto/gossip/StubPeer.java          (peer fittizio condiviso)
+src/test/java/com/progetto/worker/WorkerExecutionTest.java
+```
+
+### Comandi utili
+
+```bash
+mvn test                                  # tutta la suite
+mvn test -Dtest=GossipServiceTest         # una sola classe
+mvn test -Dtest=GossipServiceTest#aStalledRoundSkipsDetectionInsteadOfEvictingTheWholeCluster
+mvn -o test                               # senza rete, a dipendenze già scaricate
+```
+
+### Cosa coprono
+
+- `ClusterStateTest` (11 test) — regole di merge: last-writer-wins stretto sulla versione, heartbeat ristampato con l'orologio *locale* (così il cluster non ha bisogno di clock sincronizzati), view relayata già nota che non deve rinfrescare l'heartbeat, filtro sui peer conosciuti, esclusione della propria view.
+- `GossipServiceTest` (17 test) — scelta del target di forwarding e soglia di sbilanciamento, prenotazione degli slot che impedisce a una raffica di finire tutta sullo stesso peer, version floor dopo un restart, e la failure detection completa: espulsione di un peer silenzioso, nessuna espulsione di un peer che continua a gossippare, round in ritardo che salta la detection, e grazia che resta temporanea.
+- `WorkerExecutionTest` (14 test) — i tre tipi di task, i percorsi di errore (tipo sconosciuto, payload mancante, dimensioni incompatibili) con la verifica che l'esecutore sopravviva a un job fallito, la deduplica delle consegne doppie (e la conferma che due task identici restino comunque due job distinti), e la gestione dei peer (`registerPeer` che sostituisce uno stub morto, rifiuto dell'auto-registrazione, copia difensiva).
+
+Il tempo è iniettabile — `GossipService` ha un costruttore package-private che accetta un `LongSupplier`, e `gossipRound()` è richiamabile direttamente invece di aspettare lo scheduler. Per questo `WorkerView` e `ClusterState` ricevono l'istante come parametro anziché leggere `System.currentTimeMillis()` al proprio interno: una soglia da 6 secondi si attraversa senza attese reali, e la semantica dell'heartbeat resta visibile nelle firme.
+
+**Cosa non è coperto**, di proposito:
+
+- il percorso RMI end-to-end (join fra processi, forwarding, ri-ammissione via `exchangeState`) — richiederebbe avviare registry e JVM vere, con il rischio di flakiness da porte occupate; resta coperto dalle procedure manuali qui sotto;
+- il collegamento fra `Worker.enqueueLocally` e il contatore di carico: `gossipService` è privato e non osservabile dall'esterno, quindi la logica è testata a livello di `GossipService`;
+- `multiply` con matrici vuote o righe di lunghezza disomogenea, che oggi lancia `IndexOutOfBoundsException` invece di un errore leggibile: prima va sistemato il comportamento, poi testato.
+
+## Come testare a mano
 
 C'è un unico client, `com.progetto.client.Client`. Tutti gli argomenti sono opzionali:
 
@@ -85,10 +151,30 @@ Con un cluster di 3 nodi e `Client ... stress 10 3000` i 10 job si distribuiscon
 
 È possibile testare la reattività della Failure Detection simulando il congelamento/blocco di un worker senza chiudere la sua socket TCP:
 
-1. Avvia un cluster di 3 worker (`worker-1` su porta 1099, `worker-2` su 1100, `worker-3` su 1101).
+1. Avvia un cluster di 3 worker (`worker-1` su porta 1099, `worker-2` su 1100, `worker-3` su 1101) e aspetta che le tre view convergano.
 2. Congela `worker-3` eseguendo da un altro terminale:
    ```bash
-   kill -STOP $(pgrep -f "worker-3")
+   kill -STOP $(pgrep -f "Worker 1101 worker-3")
+   ```
+3. Dopo ~6-10s, nei log di `worker-1` e `worker-2` compare:
+   ```
+   [worker-1] FAILURE DETECTION: Node worker-3 has timed out, removed from peers.
+   ```
+   e i round di gossip successivi mostrano `cluster now: worker-2(...) worker-1(...)`, senza `worker-3`.
+4. Scongela il nodo:
+   ```bash
+   kill -CONT $(pgrep -f "Worker 1101 worker-3")
+   ```
+5. Verifica che il cluster **si ricomponga** (è il punto del test — l'espulsione non deve essere definitiva):
+   - `worker-3` stampa `scheduler stalled for NNNNNms -> skipping failure detection` e **non** espelle `worker-1`/`worker-2`;
+   - `worker-1` e `worker-2` stampano `added worker-3` entro un round o due;
+   - tutte e tre le view tornano a elencare i tre nodi.
+
+   Un `FAILURE DETECTION` stampato da `worker-3` al risveglio, o un `worker-3` che non ricompare più nelle view degli altri, sono regressioni.
+
+### Test del restart
+
+Ucci­di un worker e riavvialo con lo **stesso** id (`kill -9` + rilancio dello stesso comando). Devi vedere `stub refreshed (peer restarted?) for worker-3` (se il riavvio batte i 6s di timeout) oppure `added worker-3`, e la versione di `worker-3` deve ripartire *sopra* quella che i peer avevano memorizzato, non da 1.
 
 ## Parametri CLI
 

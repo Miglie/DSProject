@@ -40,14 +40,20 @@ public final class WorkerView implements Serializable {
         return lastHeartbeat;
     }
 
-    /** Returns a new view for the same worker with updated load/version/heartbeat. */
-    public WorkerView withLoad(int newLoadCount, long newVersion) {
-        return new WorkerView(workerId, newLoadCount, newVersion, System.currentTimeMillis());
+    /**
+     * Returns a new view for the same worker with updated load/version/heartbeat.
+     *
+     * <p>The instant is passed in rather than read from the system clock so that the whole
+     * heartbeat/failure-detection path can be driven by a fake clock in tests: otherwise pinning
+     * down "this peer went quiet for longer than the threshold" would mean really sleeping for it.
+     */
+    public WorkerView withLoad(int newLoadCount, long newVersion, long now) {
+        return new WorkerView(workerId, newLoadCount, newVersion, now);
     }
 
-    /**Creates a new view with the current timestamp */
-    public WorkerView timestamp() {
-        return new WorkerView(workerId, loadCount, version, System.currentTimeMillis());
+    /**Creates a new view stamped at the given instant */
+    public WorkerView timestamp(long now) {
+        return new WorkerView(workerId, loadCount, version, now);
     }
 
     @Override

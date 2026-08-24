@@ -22,6 +22,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -45,6 +46,15 @@ public class Worker implements WorkerRemote, GossipRemote {
     private final ConcurrentHashMap<String, Job> jobs = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, JobResult> results = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, WorkerRemote> peers = new ConcurrentHashMap<>();
+    /**
+     * Job ids this worker has taken on for local execution. Guards against the same job being
+     * queued here twice — a duplicate forwardJob delivery, say. It deliberately does NOT reuse the
+     * `jobs` map: on the origin of a forwarded job that map already holds the job even though this
+     * worker never queued it, so keying the guard on `jobs` would suppress exactly the local
+     * fallback the forwarding path depends on. Job ids are per-submission UUIDs, so two identical
+     * tasks are two distinct jobs and both still run.
+     */
+    private final Set<String> locallyAccepted = ConcurrentHashMap.newKeySet();
     private final GossipService gossipService;
     private final ExecutorService forwardingExecutor = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "worker-forward");
@@ -109,11 +119,16 @@ public class Worker implements WorkerRemote, GossipRemote {
     public void registerPeer(String peerId, WorkerRemote peerStub) throws RemoteException{
         //Avoid registering itself
         if (peerId.equals(this.workerId)) return;
-        // putIfAbsent instead of containsKey+put to guarantee atomicity,
-        // so two concurrent joins for the same peerId could both pass the check and double-log.
-        if (peers.putIfAbsent(peerId, peerStub) == null) {
+        // Unconditional put, not putIfAbsent: a worker that restarts keeps its id but is exported on
+        // a fresh anonymous port, so the stub we already hold is dead. Keeping the old one would
+        // make every call to that peer fail forever. put() is atomic and returns the displaced
+        // value, so the logging below still fires exactly once per actual change.
+        WorkerRemote previous = peers.put(peerId, peerStub);
+        if (previous == null) {
             //Debugging print
             networkLog(peerId, "added");
+        } else if (!previous.equals(peerStub)) {
+            networkLog(peerId, "stub refreshed (peer restarted?) for");
         }
     }
 
@@ -125,7 +140,13 @@ public class Worker implements WorkerRemote, GossipRemote {
 
     /** Called inside GossipService, exchanges state info between peers */
     @Override
-    public ClusterState exchangeState(ClusterState callerState) throws RemoteException {
+    public ClusterState exchangeState(String callerId, WorkerRemote callerStub, ClusterState callerState)
+            throws RemoteException {
+        // Anti-entropy on membership. Failure detection can only remove peers; this is the only
+        // path that adds one back, and it needs no extra protocol — a peer we evicted announces
+        // itself simply by carrying on gossiping. Without it a node that merely stalled would be
+        // gone from our view for good and the cluster would stay split forever.
+        registerPeer(callerId, callerStub);
         return gossipService.exchangeState(callerState);
     }
 
@@ -138,15 +159,26 @@ public class Worker implements WorkerRemote, GossipRemote {
 
     /**Enqueue a job for local execution, updating local state. */
     private void enqueueLocally(Job job) throws RemoteException {
+        if (!locallyAccepted.add(job.getJobId())) {
+            log(job, "SKIPPED (already accepted for local execution here)");
+            return;
+        }
         jobs.putIfAbsent(job.getJobId(), job);
+        // Counted before the put, not after: the executor could otherwise take and finish the job
+        // (recording -1) before the +1 landed, leaving the load permanently negative.
         gossipService.recordLocalLoadChange(1);
-        log(job, "QUEUED locally");
         try {
             queue.put(job);
         } catch (InterruptedException e) {
+            // The job never made it into the queue, so nothing will ever record its completion.
+            // Without this the counter keeps the +1 forever and the worker looks busier than it is,
+            // and the guard above would refuse a later, legitimate retry of a job that never ran.
+            gossipService.recordLocalLoadChange(-1);
+            locallyAccepted.remove(job.getJobId());
             Thread.currentThread().interrupt();
             throw new RemoteException("Interrupted while queueing job " + job.getJobId(), e);
         }
+        log(job, "QUEUED locally");
     }
 
     /**
@@ -168,7 +200,9 @@ public class Worker implements WorkerRemote, GossipRemote {
             log(job, "FORWARD to " + peerId + " ABANDONED (worker shutting down)");
         } catch (Exception e) {
             log(job, "FORWARD to " + peerId + " FAILED (" + e.getMessage() + "), evicting peer and executing locally instead");
-            //TODO: è sufficiente per beccare i crash?
+            // Eviction here is not the last word: if the peer was only stalled it re-registers
+            // itself on its next gossip round (see exchangeState). Re-running the job locally is
+            // still at-least-once — a peer that comes back may have executed it too.
             peers.remove(peerId);
             gossipService.forgetPeer(peerId);
             try {
@@ -188,6 +222,13 @@ public class Worker implements WorkerRemote, GossipRemote {
             throws RemoteException, InterruptedException {
         int consecutiveFailures = 0;
         while (true) {
+            // The gossip failure detector may have declared this peer dead while we were polling
+            // it. It is the authoritative, cluster-wide signal and it fires within one heartbeat
+            // threshold; waiting for MAX_CONSECUTIVE_POLL_FAILURES timeouts instead would take
+            // several times longer, with the client blocked the whole while.
+            if (!peers.containsKey(peerId)) {
+                throw new RemoteException("Peer " + peerId + " was evicted from the cluster while holding job " + jobId);
+            }
             try {
                 return stub.getResult(jobId);
             } catch (JobNotCompletedException e) {
@@ -317,7 +358,9 @@ public class Worker implements WorkerRemote, GossipRemote {
 
         Worker worker = new Worker(workerId);
         WorkerRemote stub = (WorkerRemote) UnicastRemoteObject.exportObject(worker, 0);
-        worker.selfStub = stub; //selfStub inizialization
+        worker.selfStub = stub; //selfStub initialization
+        //Gossip needs it too: every exchange carries our stub so peers can (re-)register us.
+        worker.gossipService.setSelfStub(stub);
 
         Registry registry = LocateRegistry.createRegistry(port);
         String bindName = "worker/" + workerId;
@@ -345,8 +388,6 @@ public class Worker implements WorkerRemote, GossipRemote {
                 }
             }
 
-            gossipService.bootstrap((GossipRemote) targetPeer, targetWorkerId);
-
             //Contacting all remote peers acquired to perform handshake, dropping the unreachable ones
             Iterator<Map.Entry<String, WorkerRemote>> it = this.peers.entrySet().iterator();
             while (it.hasNext()) {
@@ -360,6 +401,11 @@ public class Worker implements WorkerRemote, GossipRemote {
                     it.remove();
                 }
             }
+
+            //Only now, after the handshake: the seed filters incoming views against its own peer
+            //list, so bootstrapping first would have had it silently discard the half of the
+            //exchange we push, and it would have learnt our load a full gossip round later.
+            gossipService.bootstrap((GossipRemote) targetPeer, targetWorkerId);
         }
         catch (NotBoundException e){
             System.err.println("No worker found with id " + targetWorkerId);
@@ -398,7 +444,6 @@ public class Worker implements WorkerRemote, GossipRemote {
     }
 }
 
-//TODO: Heartbeat (con ts?) da implementare bene FATTO
-//TODO: Controllare crash detection FATTO
 //TODO: Log su disco
 //TODO: Ripresa processo crashato tenendo il tutto coerente
+//TODO: Deduplica dei job rieseguiti localmente dopo un forward fallito (oggi at-least-once)
