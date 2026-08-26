@@ -153,7 +153,7 @@ public class GossipService {
     }
 
     /**
-     * Lifts the local version counter above whatever version of <em>us</em> the caller is holding.
+     * Lifts the local version counter above whatever version of us the caller is holding.
      * After a restart the counter is back near zero while peers still gossip a high-versioned copy
      * of our old entry; without this, every update we produce would lose the last-writer-wins
      * comparison on the peers' side and our load would stay frozen at its pre-crash value forever.

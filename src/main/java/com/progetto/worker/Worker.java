@@ -146,6 +146,8 @@ public class Worker implements WorkerRemote, GossipRemote {
         // path that adds one back, and it needs no extra protocol — a peer we evicted announces
         // itself simply by carrying on gossiping. Without it a node that merely stalled would be
         // gone from our view for good and the cluster would stay split forever.
+        //This is useful when a worker stops and after some time restarts working on its own: not useful
+        //insted when the crash needs to be resolved manually (CTRL C on terminal)
         registerPeer(callerId, callerStub);
         return gossipService.exchangeState(callerState);
     }
@@ -349,6 +351,7 @@ public class Worker implements WorkerRemote, GossipRemote {
                 LocalDateTime.now(), workerId, message + " " + peerId);
     }
 
+    //Setting up RMI, starting GossipService, creating Worker instance
     public static Worker start(String workerId, int port) throws RemoteException {
         // Default RMI response timeout is effectively unbounded. No call blocks for the duration
         // of a job any more (forwardJob() only enqueues, and the origin polls for the result), so
@@ -402,6 +405,7 @@ public class Worker implements WorkerRemote, GossipRemote {
                 }
             }
 
+            //Bootstrap to acquire the ClusterView of seed node and start with already updated inforamtion
             //Only now, after the handshake: the seed filters incoming views against its own peer
             //list, so bootstrapping first would have had it silently discard the half of the
             //exchange we push, and it would have learnt our load a full gossip round later.
@@ -447,3 +451,4 @@ public class Worker implements WorkerRemote, GossipRemote {
 //TODO: Log su disco
 //TODO: Ripresa processo crashato tenendo il tutto coerente
 //TODO: Deduplica dei job rieseguiti localmente dopo un forward fallito (oggi at-least-once)
+//Ultimo potrebbe rimanere cosi...eventualmente nella lista di possibili improvements
