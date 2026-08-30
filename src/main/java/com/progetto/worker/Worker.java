@@ -31,16 +31,6 @@ import java.util.concurrent.LinkedBlockingQueue;
 
 public class Worker implements WorkerRemote, GossipRemote {
 
-    /** How often the origin re-asks a peer for the result of a job it forwarded. */
-    private static final long FORWARD_POLL_INTERVAL_MS = 200;
-
-    /**
-     * Consecutive failed polls before the origin gives up on a peer that had already accepted a
-     * job. Tolerating a few keeps a momentary hiccup from triggering a duplicate local re-run of
-     * a job the peer is still perfectly happily executing.
-     */
-    private static final int MAX_CONSECUTIVE_POLL_FAILURES = 3;
-
     private final String workerId;
     private final BlockingQueue<Job> queue = new LinkedBlockingQueue<>();
     private final ConcurrentHashMap<String, Job> jobs = new ConcurrentHashMap<>();
@@ -77,7 +67,7 @@ public class Worker implements WorkerRemote, GossipRemote {
      */
     @Override
     public Job submitJob(Task task) throws RemoteException {
-        Job job = new Job(task);
+        Job job = new Job(task, this.workerId);
         jobs.put(job.getJobId(), job);
 
         String target = gossipService.reserveForwardTarget();
@@ -159,6 +149,16 @@ public class Worker implements WorkerRemote, GossipRemote {
         enqueueLocally(job);
     }
 
+    @Override
+    public void pushResult(JobResult result) throws RemoteException {
+        Job job = jobs.get(result.getJobId());
+        if (job != null) {
+            results.put(result.getJobId(), result);
+            job.setStatus(result.isSuccess() ? JobStatus.COMPLETED : JobStatus.FAILED);
+            log(job, "Push result received. Output: " + result.getOutput());
+        }
+    }
+
     /**Enqueue a job for local execution, updating local state. */
     private void enqueueLocally(Job job) throws RemoteException {
         if (!locallyAccepted.add(job.getJobId())) {
@@ -184,8 +184,8 @@ public class Worker implements WorkerRemote, GossipRemote {
     }
 
     /**
-     * Hands a job to a peer, waits for the peer's result and records it as if this worker had run
-     * it — the client only ever talks to the worker it submitted to.
+     * Hands a job to another peer which is less overloaded, then returns. Result is notify asinchronously
+     * by the executor, which by the way is completely transparent to the origin.
      */
     private void forwardToPeer(Job job, String peerId) {
         try {
@@ -194,12 +194,7 @@ public class Worker implements WorkerRemote, GossipRemote {
                 throw new RemoteException("Peer " + peerId + " is no longer known");
             }
             ((GossipRemote) stub).forwardJob(job);
-            JobResult result = awaitRemoteResult(stub, job.getJobId(), peerId);
-            publishResult(job, result);
-            log(job, "FORWARD to " + peerId + " completed -> output=" + result.getOutput());
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            log(job, "FORWARD to " + peerId + " ABANDONED (worker shutting down)");
+            log(job, "FORWARDED to " + peerId + " (awating for results)");
         } catch (Exception e) {
             log(job, "FORWARD to " + peerId + " FAILED (" + e.getMessage() + "), evicting peer and executing locally instead");
             // Eviction here is not the last word: if the peer was only stalled it re-registers
@@ -216,35 +211,6 @@ public class Worker implements WorkerRemote, GossipRemote {
             }
         } finally {
             gossipService.releaseForwardSlot(peerId);
-        }
-    }
-
-    /**Polls the remote stub to get result of a job handled by a peer. Only fails <= treshold are tolerated.*/
-    private JobResult awaitRemoteResult(WorkerRemote stub, String jobId, String peerId)
-            throws RemoteException, InterruptedException {
-        int consecutiveFailures = 0;
-        while (true) {
-            // The gossip failure detector may have declared this peer dead while we were polling
-            // it. It is the authoritative, cluster-wide signal and it fires within one heartbeat
-            // threshold; waiting for MAX_CONSECUTIVE_POLL_FAILURES timeouts instead would take
-            // several times longer, with the client blocked the whole while.
-            if (!peers.containsKey(peerId)) {
-                throw new RemoteException("Peer " + peerId + " was evicted from the cluster while holding job " + jobId);
-            }
-            try {
-                return stub.getResult(jobId);
-            } catch (JobNotCompletedException e) {
-                consecutiveFailures = 0;
-            } catch (JobNotFoundException e) {
-                // The peer accepted the job and then forgot it — it restarted, so nobody is
-                // running it and the origin has to.
-                throw new RemoteException("Peer " + peerId + " lost forwarded job " + jobId, e);
-            } catch (RemoteException e) {
-                if (++consecutiveFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
-                    throw e;
-                }
-            }
-            Thread.sleep(FORWARD_POLL_INTERVAL_MS);
         }
     }
 
@@ -279,8 +245,26 @@ public class Worker implements WorkerRemote, GossipRemote {
 
     /**Result of a completed job is added to the worker state.*/
     private void publishResult(Job job, JobResult result) {
-        results.put(job.getJobId(), result);
-        job.setStatus(result.isSuccess() ? JobStatus.COMPLETED : JobStatus.FAILED);
+        String originId = job.getOriginWorkerId();
+
+        if(originId == null || originId.equals(this.workerId)){
+            results.put(job.getJobId(), result);
+            job.setStatus(result.isSuccess() ? JobStatus.COMPLETED : JobStatus.FAILED);
+        }
+        else {
+            WorkerRemote originStub = peers.get(originId);
+            if(originStub != null){
+                try{
+                    originStub.pushResult(result);
+                } catch (RemoteException e) {
+                    log(job, "Failed to push result to origin node" + originId + ": " + e.getMessage());
+                }
+            }else {
+                log(job, "Origin worker " + originId + " is not reachable for pushing result. Result saved locally as fallback.");
+                results.put(job.getJobId(), result);
+                job.setStatus(result.isSuccess() ? JobStatus.COMPLETED : JobStatus.FAILED);
+            }
+        }
     }
 
     @SuppressWarnings("unchecked")

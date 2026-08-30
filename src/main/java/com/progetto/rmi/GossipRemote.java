@@ -2,6 +2,7 @@ package com.progetto.rmi;
 
 import com.progetto.gossip.ClusterState;
 import com.progetto.job.Job;
+import com.progetto.job.JobResult;
 
 import java.rmi.Remote;
 import java.rmi.RemoteException;
