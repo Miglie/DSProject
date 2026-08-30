@@ -27,4 +27,7 @@ public interface GossipRemote extends Remote {
      * Returns as soon as the job is queued rather than when it finishes
      */
     void forwardJob(Job job) throws RemoteException;
+
+    //TODO:Is stealerId useful in some way?
+    Job stealJob(String stealerId) throws RemoteException;
 }

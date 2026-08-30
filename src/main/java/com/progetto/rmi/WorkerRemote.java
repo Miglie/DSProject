@@ -23,7 +23,4 @@ public interface WorkerRemote extends Remote {
     //TODO:Queste due funzioni devono ancora essere implementate
     /** Enables a push approach to notify the origin about a JobResult */
     void pushResult(JobResult result) throws RemoteException;
-
-    //TODO:Is stealerId useful in some way?
-    //Job stealJob(String stealerId) throws RemoteException;
 }

@@ -22,17 +22,20 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.Set;
-import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 public class Worker implements WorkerRemote, GossipRemote {
 
     private final String workerId;
-    private final BlockingQueue<Job> queue = new LinkedBlockingQueue<>();
+    private final ConcurrentLinkedDeque<Job> queue = new ConcurrentLinkedDeque<>();
     private final ConcurrentHashMap<String, Job> jobs = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, JobResult> results = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, WorkerRemote> peers = new ConcurrentHashMap<>();
@@ -51,7 +54,17 @@ public class Worker implements WorkerRemote, GossipRemote {
         t.setDaemon(true);
         return t;
     });
+    //Creates a scheduled thread to execute work stealing
+    private final ScheduledExecutorService stealerScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "work-stealer");
+        t.setDaemon(true);
+        return t;
+    });
+    private Random random = new Random();
     private WorkerRemote selfStub; //stub of local worker to send to the other nodes
+
+    //Timeout when we try to poll a empty queue before retrying
+    private static final long QUEUE_POLL_SLEEP_MS = 50L;
 
     public Worker(String workerId) {
         this.workerId = workerId;
@@ -60,6 +73,8 @@ public class Worker implements WorkerRemote, GossipRemote {
         Thread executorThread = new Thread(this::processLoop, "worker-executor-" + workerId);
         executorThread.setDaemon(true);
         executorThread.start();
+
+        stealerScheduler.scheduleWithFixedDelay(this::attemptWorkSteal, 1, 1, TimeUnit.SECONDS);
     }
 
     /** A task is submitted by the client. Gossip service is queried to choose if forward to peer or execute locally.
@@ -149,6 +164,21 @@ public class Worker implements WorkerRemote, GossipRemote {
         enqueueLocally(job);
     }
 
+    /** Called to steal a job from an overloaded peer */
+    @Override
+    public synchronized Job stealJob(String stealerId) throws RemoteException {
+        if (queue.size() <= 1) return null;
+
+        Job stolenJob = queue.pollLast();
+        if (stolenJob != null) {
+            gossipService.recordLocalLoadChange(-1);
+            locallyAccepted.remove(stolenJob.getJobId());
+            log(stolenJob, "Stolen by peer " + stealerId);
+        }
+
+        return stolenJob;
+    }
+
     @Override
     public void pushResult(JobResult result) throws RemoteException {
         Job job = jobs.get(result.getJobId());
@@ -169,17 +199,7 @@ public class Worker implements WorkerRemote, GossipRemote {
         // Counted before the put, not after: the executor could otherwise take and finish the job
         // (recording -1) before the +1 landed, leaving the load permanently negative.
         gossipService.recordLocalLoadChange(1);
-        try {
-            queue.put(job);
-        } catch (InterruptedException e) {
-            // The job never made it into the queue, so nothing will ever record its completion.
-            // Without this the counter keeps the +1 forever and the worker looks busier than it is,
-            // and the guard above would refuse a later, legitimate retry of a job that never ran.
-            gossipService.recordLocalLoadChange(-1);
-            locallyAccepted.remove(job.getJobId());
-            Thread.currentThread().interrupt();
-            throw new RemoteException("Interrupted while queueing job " + job.getJobId(), e);
-        }
+        queue.offerLast(job);
         log(job, "QUEUED locally");
     }
 
@@ -214,14 +234,45 @@ public class Worker implements WorkerRemote, GossipRemote {
         }
     }
 
+    private void attemptWorkSteal() {
+        int currentLoad = queue.size();
+        double averageLoad = gossipService.getAverageClusterLoad();
+        if (currentLoad >= averageLoad) return;
+        
+        List<String> targets = gossipService.getHigherLoadPeers();
+        if (targets.isEmpty()) return;
+
+        String targetId = targets.get(random.nextInt(targets.size()));
+        GossipRemote targetStub = (GossipRemote) peers.get(targetId);
+        if (targetStub == null) return;
+        
+        try {
+            Job stolenJob = targetStub.stealJob(this.workerId);
+            if (stolenJob != null) {
+                log(stolenJob, "Stolen from peer " + targetId);
+                enqueueLocally(stolenJob);
+            }
+        } catch (RemoteException e) {
+            System.err.printf("[%s] Error stealing job from peer %s: %s%n", workerId, targetId, e.getMessage());
+            peers.remove(targetId);
+            gossipService.forgetPeer(targetId);
+        }
+    }
+
     private void processLoop() {
-        while (true) {
+        while (!Thread.currentThread().isInterrupted()) {
             try {
-                Job job = queue.take();
-                executeJob(job);
+                //The call is not blocking -> If the queue is empty we timeoute a little before retrying
+                Job job = queue.pollFirst();
+                if (job != null) executeJob(job);
+                else Thread.sleep(QUEUE_POLL_SLEEP_MS);
+                
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return;
+            }
+            catch (Exception e) {
+                System.err.printf("[%s] Error in processLoop: %s%n", workerId, e.getMessage());
             }
         }
     }
