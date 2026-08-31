@@ -6,6 +6,7 @@ import com.progetto.job.Job;
 import com.progetto.job.JobResult;
 import com.progetto.job.JobStatus;
 import com.progetto.job.Task;
+import com.progetto.persistence.PersistenceManager;
 import com.progetto.rmi.GossipRemote;
 import com.progetto.rmi.JobNotCompletedException;
 import com.progetto.rmi.JobNotFoundException;
@@ -48,6 +49,7 @@ public class Worker implements WorkerRemote, GossipRemote {
      */
     private final Set<String> locallyAccepted = ConcurrentHashMap.newKeySet();
     private final GossipService gossipService;
+    private final PersistenceManager persistenceManager;
     private final ExecutorService forwardingExecutor = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "worker-forward");
         t.setDaemon(true);
@@ -80,6 +82,13 @@ public class Worker implements WorkerRemote, GossipRemote {
     public Worker(String workerId) {
         this.workerId = workerId;
         this.gossipService = new GossipService(workerId, peers);
+        this.persistenceManager = new PersistenceManager(workerId);
+
+        PersistenceManager.RecoveredState state = this.persistenceManager.recoverState();
+        this.jobs.putAll(state.jobs);
+        this.results.putAll(state.results);
+
+        rebuildQueueAfterRecovery();
 
         Thread executorThread = new Thread(this::processLoop, "worker-executor-" + workerId);
         executorThread.setDaemon(true);
@@ -100,6 +109,7 @@ public class Worker implements WorkerRemote, GossipRemote {
         String target = gossipService.reserveForwardTarget();
         if (target != null) {
             job.setStatus(JobStatus.DELEGATED);
+            persistenceManager.appendEvent("UPDATE_JOB", job);
             log(job, "FORWARDING to peer " + target + " (load balancing)");
             forwardingExecutor.submit(() -> forwardToPeer(job, target));
         } else {
@@ -207,6 +217,8 @@ public class Worker implements WorkerRemote, GossipRemote {
             }
             results.put(result.getJobId(), result);
             job.setStatus(result.isSuccess() ? JobStatus.COMPLETED : JobStatus.FAILED);
+            persistenceManager.appendEvent("UPDATE_RESULT", result);
+            persistenceManager.appendEvent("UPDATE_JOB", job);
             log(job, "Push result received. Output: " + result.getOutput());
         }
     }
@@ -218,6 +230,8 @@ public class Worker implements WorkerRemote, GossipRemote {
             return;
         }
         job.setStatus(JobStatus.PENDING);
+        //Saved in the log only if originated in that worker
+        if(job.getOriginWorkerId().equals(this.workerId)) persistenceManager.appendEvent("UPDATE_JOB", job);
         jobs.putIfAbsent(job.getJobId(), job);
         // Counted before the put, not after: the executor could otherwise take and finish the job
         // (recording -1) before the +1 landed, leaving the load permanently negative.
@@ -321,6 +335,7 @@ public class Worker implements WorkerRemote, GossipRemote {
 
     private void executeJob(Job job) {
         job.setStatus(JobStatus.RUNNING);
+        persistenceManager.appendEvent("UPDATE_JOB", job);
         log(job, "RUNNING");
         JobResult result;
         try {
@@ -341,6 +356,8 @@ public class Worker implements WorkerRemote, GossipRemote {
         String originId = job.getOriginWorkerId();
 
         if(originId == null || originId.equals(this.workerId)){
+            persistenceManager.appendEvent("UPDATE_RESULT", result);
+            persistenceManager.appendEvent("UPDATE_JOB", job);
             results.put(job.getJobId(), result);
             job.setStatus(result.isSuccess() ? JobStatus.COMPLETED : JobStatus.FAILED);
         }
@@ -357,6 +374,23 @@ public class Worker implements WorkerRemote, GossipRemote {
                 results.put(job.getJobId(), result);
                 job.setStatus(result.isSuccess() ? JobStatus.COMPLETED : JobStatus.FAILED);
             }
+        }
+    }
+
+    /** Insert again in the queue after recovery only jobs still pending (status PENDING or DELEGATED) or interrupted
+     *  while running with this worker as origin. A job which was delegated remotely is always requeued locally
+     * after recovery, because we do not save information abput the route jobs follow*/
+    private void rebuildQueueAfterRecovery() {
+        for(Job job : jobs.values()) {
+            if(!this.workerId.equals(job.getOriginWorkerId()) ||
+                job.getStatus() == JobStatus.COMPLETED ||
+                job.getStatus() == JobStatus.FAILED) continue;
+            
+            job.setStatus(JobStatus.PENDING);
+            queue.offerLast(job);
+            locallyAccepted.add(job.getJobId());
+            gossipService.recordLocalLoadChange(1);
+            log(job, "Recovered and requeued");
         }
     }
 
@@ -525,9 +559,5 @@ public class Worker implements WorkerRemote, GossipRemote {
     }
 }
 
-//TODO: Implementare timeout per mantenere la semantica AtLeatOnce con trasparenza per l'origine
-//TODO: Capire cosa succede quando è il nodo che deve ricevere le risposte che crasha...è possibile fare qualcosa con la persistency??
-//TODO: Log su disco
-//TODO: Ripresa processo crashato tenendo il tutto coerente
 //TODO: Deduplica dei job rieseguiti localmente dopo un forward fallito (oggi at-least-once)
 //Ultimo potrebbe rimanere cosi...eventualmente nella lista di possibili improvements

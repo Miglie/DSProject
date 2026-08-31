@@ -28,6 +28,7 @@ Infrastruttura per gestire job inviati a un cluster di worker, con join dinamico
    - **Assunzione sui task**: i task sono deterministici e privi di effetti collaterali — `SUM`, `SLEEP` e `MATRIX_MULT` lo sono. Sotto questa assunzione una doppia esecuzione spreca CPU ma è *osservazionalmente equivalente* all'exactly-once, perché produce lo stesso risultato. Task con effetti collaterali violerebbero l'assunzione e dovrebbero farsi carico da soli dell'idempotenza.
    - **Risposta univoca al client**: il nodo d'origine pubblica una sola `JobResult` per job — quella del peer se il risultato viene comunicato in push-mode dal nodo esecutore, altrimenti quella della propria riesecuzione. Il risultato calcolato da un peer che torna in vita resta nella sua mappa locale e non viene letto da nessuno. Il client non vede mai due risposte né una risposta incoerente.
    - **Deduplica locale**: ogni worker tiene traccia dei jobId che ha accettato per l'esecuzione locale (`locallyAccepted`) e ignora una seconda consegna dello stesso job. Chiude il caso "stesso job accodato due volte sullo stesso nodo"; non chiude — e non può chiudere — quello di due nodi diversi che lo eseguono entrambi. Il marcatore è volutamente distinto dalla mappa `jobs`: su chi ha inoltrato un job quella mappa lo contiene già pur non avendolo mai accodato, quindi usarla come guardia sopprimerebbe proprio il fallback locale.
+8. **Stable storage su disco**: per aumentare la resilienza in caso di crash ogni nodo salva su disco un Write-Ahead-Log con informazioni relative ai Job e ai JobResult. Ogni nodo è considerato responsabile per i job che vengono a lui sottomessi, dunque nel WAL vengono salvate informazioni solamente sui Job relativi al worker in questione e sui loro cambi di status. Quando un nodo recupera da un crash quindi rimette in coda tutti i job che risultavano ancora pending (sia quelli che erano nella coda locale sia quelli delegati ai worker remoti), per assicurarne il completamento. Inoltre dal log vengono estratti tutti i risultati dei job già completati, che vengono nuovamente resi disponibili per un eventuale poll del client.
 
 Non ancora implementato: stable storage su disco, recovery dei job in coda dopo un crash, e cancellazione best-effort sul peer prima del fallback locale — quest'ultima restringerebbe (senza chiuderla) la finestra di doppia esecuzione descritta al punto 7.
 
@@ -183,6 +184,10 @@ Avvia un solo worker (per bypassare il forwarding alla submission), invia un bur
 ### Test Job timeout con fallback locale
 
 Avvia due worker, invia un burst di carico al primo e aspetta il carico si distribuisca sul secondo. Uccidi (CTRL + C) il secondo worker e attendi la scadenza del timeout per il Job DELEGATED, che sarà preso in carico localmente dal worker origine.
+
+### Test stable storage
+
+Avvia un solo worker, manda un burst di carico e uccidilo. Poi riavvialo con l'id che avevi utilizzato precedentemente. Ora verifica che il worker riprenda l'esecuzione dei job che aveva in coda precedentemente.
 
 ## Parametri CLI
 
