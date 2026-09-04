@@ -7,9 +7,11 @@ import com.progetto.job.Task;
 import com.progetto.rmi.JobNotCompletedException;
 import com.progetto.rmi.JobNotFoundException;
 import com.progetto.rmi.WorkerRemote;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.io.File;
 import java.util.List;
 import java.util.Map;
 
@@ -28,12 +30,25 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class WorkerExecutionTest {
 
     private static final long JOB_TIMEOUT_MS = 5000;
+    private static final String WORKER_ID = "test-worker";
+    private static final String LOG_FILE = "worker_" + WORKER_ID + ".log";
 
     private Worker worker;
 
     @BeforeEach
     void setUp() {
-        worker = new Worker("test-worker");
+        // Every test shares the same worker id, and PersistenceManager derives its WAL file purely
+        // from that id — so without this, test N's Worker recovers whatever test N-1 wrote and
+        // requeues its leftover PENDING/DELEGATED jobs, growing the log and the recovered state
+        // across the whole run. Deleting it before construction, not just after, also covers a
+        // stray file left by a previous aborted run.
+        new File(LOG_FILE).delete();
+        worker = new Worker(WORKER_ID);
+    }
+
+    @AfterEach
+    void tearDown() {
+        new File(LOG_FILE).delete();
     }
 
     private JobResult runToCompletion(Task task) throws Exception {
@@ -191,7 +206,7 @@ class WorkerExecutionTest {
 
     @Test
     void registerPeerIgnoresTheWorkerItself() throws Exception {
-        worker.registerPeer("test-worker", new RecordingPeer());
+        worker.registerPeer(WORKER_ID, new RecordingPeer());
 
         assertTrue(worker.getKnownPeers().isEmpty(), "a worker must not end up as its own peer");
     }

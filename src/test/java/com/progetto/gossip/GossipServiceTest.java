@@ -3,6 +3,8 @@ package com.progetto.gossip;
 import com.progetto.rmi.WorkerRemote;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.LongSupplier;
 
@@ -157,6 +159,69 @@ class GossipServiceTest {
         service.forgetPeer("w2");
 
         assertNull(viewOf("w2"));
+    }
+
+    // ---------- work stealing (the reverse direction of forwarding) ----------
+
+    @Test
+    void averageClusterLoadWithNoKnownViewsIsZero() {
+        // Can't happen in practice (the service always has its own entry), covered anyway since
+        // getAverageClusterLoad() explicitly guards against it.
+        assertEquals(0.0, service.getAverageClusterLoad());
+    }
+
+    @Test
+    void averageClusterLoadCoversSelfAndEveryKnownPeer() {
+        addPeer("w2");
+        addPeer("w3");
+        receiveGossip("w2", 2, 1);
+        receiveGossip("w3", 4, 1);
+        service.recordLocalLoadChange(3); // self=3, w2=2, w3=4 -> average 3.0
+
+        assertEquals(3.0, service.getAverageClusterLoad());
+    }
+
+    @Test
+    void noStealTargetsWhenNoPeerExceedsTheImbalanceThreshold() {
+        addPeer("w2");
+        receiveGossip("w2", 2, 1);
+        service.recordLocalLoadChange(0); // difference is exactly 2, and the threshold is strict
+
+        assertTrue(service.getHigherLoadPeers().isEmpty());
+    }
+
+    @Test
+    void aPeerLoadedFarAboveSelfIsAStealTarget() {
+        addPeer("w2");
+        receiveGossip("w2", 5, 1);
+        service.recordLocalLoadChange(0);
+
+        assertEquals(List.of("w2"), service.getHigherLoadPeers());
+    }
+
+    @Test
+    void higherLoadPeersIgnoresPeersNotInMembership() {
+        // Mirrors aPeerEvictedFromMembershipIsNotAForwardTarget for the opposite direction: an
+        // evicted peer's stale view must not make it a steal target either.
+        addPeer("w2");
+        receiveGossip("w2", 5, 1);
+        service.recordLocalLoadChange(0);
+        peers.remove("w2");
+
+        assertTrue(service.getHigherLoadPeers().isEmpty());
+    }
+
+    @Test
+    void higherLoadPeersCanReturnMoreThanOneCandidate() {
+        addPeer("busy1");
+        addPeer("busy2");
+        addPeer("idle");
+        receiveGossip("busy1", 6, 1);
+        receiveGossip("busy2", 5, 1);
+        receiveGossip("idle", 1, 1);
+        service.recordLocalLoadChange(0);
+
+        assertEquals(Set.of("busy1", "busy2"), Set.copyOf(service.getHigherLoadPeers()));
     }
 
     // ---------- version floor (restart survival) ----------

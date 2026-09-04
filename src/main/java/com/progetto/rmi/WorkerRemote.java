@@ -20,7 +20,10 @@ public interface WorkerRemote extends Remote {
     void registerPeer(String peerId, WorkerRemote peerStub) throws RemoteException;
     Map<String, WorkerRemote> getKnownPeers() throws RemoteException;
 
-    //TODO:Queste due funzioni devono ancora essere implementate
-    /** Enables a push approach to notify the origin about a JobResult */
+    /**
+     * Delivers a completed job's result to its origin worker, replacing the older poll-based
+     * getResult()-from-a-peer approach: the executing worker pushes as soon as it finishes instead
+     * of the origin polling for it.
+     */
     void pushResult(JobResult result) throws RemoteException;
 }

@@ -24,13 +24,15 @@ Infrastruttura per gestire job inviati a un cluster di worker, con join dinamico
    - **Ri-ammissione (anti-entropy sulla membership)**: la failure detection può solo *togliere* peer, quindi serve un percorso simmetrico per rimetterli. Ogni `exchangeState` porta id e stub del chiamante, e il ricevente lo ri-registra: un nodo che era solo rallentato rientra da solo al primo round utile, senza protocolli aggiuntivi. Senza questo, chi veniva espulso per un blocco temporaneo spariva per sempre e il cluster restava spaccato.
    - **Rilevamento dello stallo locale**: se un round arriva con più di `SCHEDULER_STALL_THRESHOLD_MS` di ritardo, il blocco eravamo noi (JVM congelata, GC lungo, SIGSTOP): tutti gli heartbeat sembrano vecchi per colpa nostra. In quel round la failure detection viene saltata e i timestamp vengono rinfrescati in blocco, altrimenti il nodo appena risvegliato espellerebbe l'intero cluster in un colpo solo.
    - **Restart con lo stesso id**: `registerPeer` sostituisce sempre lo stub (un processo riavviato è esportato su una porta anonima diversa, quello vecchio è morto), e il version counter viene rialzato sopra la versione che i peer conservano di noi — altrimenti dopo un riavvio ogni nostro aggiornamento perderebbe il confronto last-writer-wins e il nostro carico resterebbe congelato al valore pre-crash.
-7. **Semantica di esecuzione — at-least-once, e perché non può essere exactly-once**: il fallback locale scatta quando il peer è *irraggiungibile*, cioè esattamente nella situazione in cui non si può distinguere "è morto" da "è lento o partizionato ma sta eseguendo il job". Senza un servizio di coordinamento esterno (lease, fencing token) l'exactly-once attraverso una partizione non è ottenibile: è un limite teorico, non una mancanza di questa implementazione. Il sistema garantisce quindi **at-least-once**, e tre proprietà lo rendono innocuo:
+7. **Semantica di esecuzione — at-least-once, e perché non può essere exactly-once**: il fallback locale scatta in due casi distinti — un peer *irraggiungibile* (connection refused, RMI fallita), oppure un job rimasto in stato `DELEGATED` da più di `DELEGATED_JOB_TIMEOUT_MS` (10s) senza che sia arrivato un `pushResult`. Il secondo caso è più frequente e **non implica che il peer sia morto o irraggiungibile**: è un timeout fisso, indipendente dalla durata reale del task, quindi un task legittimamente più lento della soglia (o semplicemente in coda dietro ad altri sul peer) fa scattare il fallback come falso allarme mentre il peer sta ancora lavorando correttamente. In entrambi i casi non si può distinguere "è morto" da "è lento ma vivo": senza un servizio di coordinamento esterno (lease, fencing token) l'exactly-once attraverso una partizione non è ottenibile — è un limite teorico, non una mancanza di questa implementazione. Il sistema garantisce quindi **at-least-once**, e tre proprietà lo rendono innocuo:
    - **Assunzione sui task**: i task sono deterministici e privi di effetti collaterali — `SUM`, `SLEEP` e `MATRIX_MULT` lo sono. Sotto questa assunzione una doppia esecuzione spreca CPU ma è *osservazionalmente equivalente* all'exactly-once, perché produce lo stesso risultato. Task con effetti collaterali violerebbero l'assunzione e dovrebbero farsi carico da soli dell'idempotenza.
-   - **Risposta univoca al client**: il nodo d'origine pubblica una sola `JobResult` per job — quella del peer se il risultato viene comunicato in push-mode dal nodo esecutore, altrimenti quella della propria riesecuzione. Il risultato calcolato da un peer che torna in vita resta nella sua mappa locale e non viene letto da nessuno. Il client non vede mai due risposte né una risposta incoerente.
+   - **Risposta univoca al client**: il nodo d'origine pubblica una sola `JobResult` per job — quella del peer se il risultato viene comunicato in push-mode dal nodo esecutore, altrimenti quella della propria riesecuzione. Un secondo `pushResult` per un job già terminale viene scartato esplicitamente (`"Duplicate push result received... (ignored)"`), quindi il client non vede mai due risposte né una risposta incoerente, anche quando il task è stato davvero eseguito due volte.
    - **Deduplica locale**: ogni worker tiene traccia dei jobId che ha accettato per l'esecuzione locale (`locallyAccepted`) e ignora una seconda consegna dello stesso job. Chiude il caso "stesso job accodato due volte sullo stesso nodo"; non chiude — e non può chiudere — quello di due nodi diversi che lo eseguono entrambi. Il marcatore è volutamente distinto dalla mappa `jobs`: su chi ha inoltrato un job quella mappa lo contiene già pur non avendolo mai accodato, quindi usarla come guardia sopprimerebbe proprio il fallback locale.
+
+   Il caso "due nodi diversi eseguono lo stesso job" non è solo teorico: è riproducibile in modo deterministico su un cluster reale quando il falso allarme del punto sopra rimette in coda localmente una copia del job che poi il work stealing di un **terzo** worker preleva prima che arrivi il `pushResult` vero — a quel punto il task gira per intero su due nodi. Resta sicuro (nessuna corruzione di stato, un solo risultato consegnato al client) ma spreca CPU reale; chiuderlo davvero richiede una cancellazione best-effort sul peer originario prima del fallback, non ancora implementata (vedi il TODO in fondo a `Worker.java`).
 8. **Stable storage su disco**: per aumentare la resilienza in caso di crash ogni nodo salva su disco un Write-Ahead-Log con informazioni relative ai Job e ai JobResult. Ogni nodo è considerato responsabile per i job che vengono a lui sottomessi, dunque nel WAL vengono salvate informazioni solamente sui Job relativi al worker in questione e sui loro cambi di status. Quando un nodo recupera da un crash quindi rimette in coda tutti i job che risultavano ancora pending (sia quelli che erano nella coda locale sia quelli delegati ai worker remoti), per assicurarne il completamento. Inoltre dal log vengono estratti tutti i risultati dei job già completati, che vengono nuovamente resi disponibili per un eventuale poll del client.
 
-Non ancora implementato: stable storage su disco, recovery dei job in coda dopo un crash, e cancellazione best-effort sul peer prima del fallback locale — quest'ultima restringerebbe (senza chiuderla) la finestra di doppia esecuzione descritta al punto 7.
+Non ancora implementato: cancellazione best-effort sul peer prima del fallback locale (punto 7) e shutdown pulito (un `kill`/Ctrl-C non avvisa i peer, che se ne accorgono solo dopo il timeout della failure detection).
 
 ## Come compilare
 
@@ -61,7 +63,7 @@ Ogni worker stampa su console gli handshake di join e, ogni 2s, i round di gossi
 mvn test
 ```
 
-42 test JUnit 5, nessuna rete e nessun registry RMI coinvolti: girano in pochi secondi.
+69 test JUnit 5, nessuna rete e nessun registry RMI coinvolti: girano in pochi secondi.
 
 ### Setup
 
@@ -87,9 +89,13 @@ I test stanno in `src/test/java` e rispecchiano i package del codice, così hann
 ```
 src/test/java/com/progetto/gossip/ClusterStateTest.java
 src/test/java/com/progetto/gossip/GossipServiceTest.java
-src/test/java/com/progetto/gossip/StubPeer.java          (peer fittizio condiviso)
+src/test/java/com/progetto/gossip/StubPeer.java              (peer fittizio condiviso)
+src/test/java/com/progetto/persistence/PersistenceManagerTest.java
 src/test/java/com/progetto/worker/WorkerExecutionTest.java
+src/test/java/com/progetto/worker/WorkerStealingTest.java
 ```
+
+`PersistenceManagerTest` e `WorkerStealingTest` usano ciascun test-method un worker id generato al volo (UUID) invece di uno condiviso, e ripuliscono il proprio file di log in `@AfterEach`: `PersistenceManager` scrive `worker_<id>.log` nella working directory, quindi un id condiviso fra più test farebbe rileggere ad ognuno lo stato lasciato dal precedente — è il motivo per cui anche `WorkerExecutionTest` (id fisso `"test-worker"`, condiviso apposta perché serve un solo worker per l'intera classe) cancella quel file in `@BeforeEach`/`@AfterEach`.
 
 ### Comandi utili
 
@@ -103,8 +109,10 @@ mvn -o test                               # senza rete, a dipendenze già scaric
 ### Cosa coprono
 
 - `ClusterStateTest` (11 test) — regole di merge: last-writer-wins stretto sulla versione, heartbeat ristampato con l'orologio *locale* (così il cluster non ha bisogno di clock sincronizzati), view relayata già nota che non deve rinfrescare l'heartbeat, filtro sui peer conosciuti, esclusione della propria view.
-- `GossipServiceTest` (17 test) — scelta del target di forwarding e soglia di sbilanciamento, prenotazione degli slot che impedisce a una raffica di finire tutta sullo stesso peer, version floor dopo un restart, e la failure detection completa: espulsione di un peer silenzioso, nessuna espulsione di un peer che continua a gossippare, round in ritardo che salta la detection, e grazia che resta temporanea.
+- `GossipServiceTest` (23 test) — scelta del target di forwarding e soglia di sbilanciamento, prenotazione degli slot che impedisce a una raffica di finire tutta sullo stesso peer, version floor dopo un restart, la failure detection completa (espulsione di un peer silenzioso, nessuna espulsione di un peer che continua a gossippare, round in ritardo che salta la detection, grazia che resta temporanea), e la selezione dei bersagli per il work stealing (`getHigherLoadPeers`/`getAverageClusterLoad`) con lo stesso filtro sui peer conosciuti usato dal forwarding.
+- `PersistenceManagerTest` (10 test) — round-trip di append/recover per job e risultati, last-write-wins fra più eventi sullo stesso jobId, resilienza a righe malformate o a un payload nullo, stato vuoto su un id mai visto.
 - `WorkerExecutionTest` (14 test) — i tre tipi di task, i percorsi di errore (tipo sconosciuto, payload mancante, dimensioni incompatibili) con la verifica che l'esecutore sopravviva a un job fallito, la deduplica delle consegne doppie (e la conferma che due task identici restino comunque due job distinti), e la gestione dei peer (`registerPeer` che sostituisce uno stub morto, rifiuto dell'auto-registrazione, copia difensiva).
+- `WorkerStealingTest` (11 test) — `stealJob` (niente furto da una coda con ≤1 job, prelievo dalla coda opposta a quella di esecuzione, `DELEGATED` solo quando il ladro sottrae a se stesso... cioè quando l'origine coincide col derubato), `pushResult` (completamento, no-op su un job sconosciuto, un secondo push su un job già terminale viene ignorato), e due regressioni verificate anche dal vivo su cluster reali: un job completato via push che era ancora fisicamente in coda non viene mai rieseguito, e un worker riavviato con lo stesso id non riesegue mai un job già completato prima del crash.
 
 Il tempo è iniettabile — `GossipService` ha un costruttore package-private che accetta un `LongSupplier`, e `gossipRound()` è richiamabile direttamente invece di aspettare lo scheduler. Per questo `WorkerView` e `ClusterState` ricevono l'istante come parametro anziché leggere `System.currentTimeMillis()` al proprio interno: una soglia da 6 secondi si attraversa senza attese reali, e la semantica dell'heartbeat resta visibile nelle firme.
 
@@ -112,7 +120,9 @@ Il tempo è iniettabile — `GossipService` ha un costruttore package-private ch
 
 - il percorso RMI end-to-end (join fra processi, forwarding, ri-ammissione via `exchangeState`) — richiederebbe avviare registry e JVM vere, con il rischio di flakiness da porte occupate; resta coperto dalle procedure manuali qui sotto;
 - il collegamento fra `Worker.enqueueLocally` e il contatore di carico: `gossipService` è privato e non osservabile dall'esterno, quindi la logica è testata a livello di `GossipService`;
-- `multiply` con matrici vuote o righe di lunghezza disomogenea, che oggi lancia `IndexOutOfBoundsException` invece di un errore leggibile: prima va sistemato il comportamento, poi testato.
+- `multiply` con matrici vuote o righe di lunghezza disomogenea, che oggi lancia `IndexOutOfBoundsException` invece di un errore leggibile: prima va sistemato il comportamento, poi testato;
+- la soglia esatta di `checkDelegatedJobsTimeout` (`DELEGATED_JOB_TIMEOUT_MS`, fissa a 10s): `Worker`, a differenza di `GossipService`, non ha un clock iniettabile, quindi non c'è modo di attraversare quella soglia in un test senza aspettarla per davvero;
+- lo scenario a tre nodi del punto 7 (falso allarme del timeout → furto da parte di un terzo worker → doppia esecuzione reale): richiede RMI vero fra più `Worker`, non solo chiamate dirette sullo stesso processo — verificato dal vivo (vedi il TODO in fondo a `Worker.java`), non da un test automatico.
 
 ## Come testare a mano
 

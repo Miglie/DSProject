@@ -192,16 +192,27 @@ public class Worker implements WorkerRemote, GossipRemote {
         if (queue.size() <= 1) return null;
 
         Job stolenJob = queue.pollLast();
-        if (stolenJob != null) {
+        if (stolenJob == null) return null;
+
+        // A job whose result already arrived via pushResult() can still be sitting here if a
+        // DELEGATED timeout requeued it locally as a false alarm (the remote peer was only slow,
+        // not dead) before pushResult had a chance to remove it. Offering a terminal job for theft
+        // would resurrect it: the thief flips its status back to DELEGATED below, which re-arms the
+        // origin's timeout and eventually causes a real second execution — a livelock, not just a
+        // duplicate. Discard it here instead.
+        if (stolenJob.getStatus() == JobStatus.COMPLETED || stolenJob.getStatus() == JobStatus.FAILED) {
             gossipService.recordLocalLoadChange(-1);
-            locallyAccepted.remove(stolenJob.getJobId());
-            //If a job is being stolen from the origin node, status is changed to delegated
-            if (stolenJob.getOriginWorkerId() != null && stolenJob.getOriginWorkerId().equals(this.workerId)) {
-                stolenJob.setStatus(JobStatus.DELEGATED);
-            }
-            log(stolenJob, "Stolen by peer " + stealerId);
+            log(stolenJob, "Discarded stale completed job found in queue during steal (not offered)");
+            return null;
         }
 
+        gossipService.recordLocalLoadChange(-1);
+        locallyAccepted.remove(stolenJob.getJobId());
+        //If a job is being stolen from the origin node, status is changed to delegated
+        if (stolenJob.getOriginWorkerId() != null && stolenJob.getOriginWorkerId().equals(this.workerId)) {
+            stolenJob.setStatus(JobStatus.DELEGATED);
+        }
+        log(stolenJob, "Stolen by peer " + stealerId);
         return stolenJob;
     }
 
@@ -217,6 +228,12 @@ public class Worker implements WorkerRemote, GossipRemote {
             }
             results.put(result.getJobId(), result);
             job.setStatus(result.isSuccess() ? JobStatus.COMPLETED : JobStatus.FAILED);
+            // If a DELEGATED timeout fired earlier as a false alarm, this job was requeued locally
+            // and may still be sitting in the queue. Remove it now: left there, work stealing or
+            // this worker's own executor would eventually reach it, and neither checks status before
+            // touching a queue entry — see the guards in stealJob and processLoop for what happens
+            // if this race is lost anyway (pop happening a moment before this removal).
+            queue.removeIf(queued -> queued.getJobId().equals(result.getJobId()));
             persistenceManager.appendEvent("UPDATE_RESULT", result);
             persistenceManager.appendEvent("UPDATE_JOB", job);
             log(job, "Push result received. Output: " + result.getOutput());
@@ -232,7 +249,17 @@ public class Worker implements WorkerRemote, GossipRemote {
         job.setStatus(JobStatus.PENDING);
         //Saved in the log only if originated in that worker
         if(job.getOriginWorkerId().equals(this.workerId)) persistenceManager.appendEvent("UPDATE_JOB", job);
-        jobs.putIfAbsent(job.getJobId(), job);
+        // Unconditional put, not putIfAbsent: a job that comes back through here a second time (the
+        // clearest case is this worker stealing back, via attemptWorkSteal, a job it had itself
+        // forwarded out — the origin's own work-stealer doesn't know it just forwarded that job) is
+        // always a *fresh, deserialized* Job object, distinct from whatever this worker already had
+        // on file for that id. putIfAbsent would keep the OLD object as the map's authoritative entry
+        // while this new one is the one that actually goes into the queue and gets executed — leaving
+        // getStatus()/checkDelegatedJobsTimeout permanently reading a stale, frozen status (typically
+        // DELEGATED) for a job that has, in reality, already completed. A client polling getStatus()
+        // would then hang forever, and checkDelegatedJobsTimeout would retry this same id every
+        // 2 seconds indefinitely (its own copy of the job never leaves DELEGATED either).
+        jobs.put(job.getJobId(), job);
         // Counted before the put, not after: the executor could otherwise take and finish the job
         // (recording -1) before the +1 landed, leaving the load permanently negative.
         gossipService.recordLocalLoadChange(1);
@@ -320,9 +347,20 @@ public class Worker implements WorkerRemote, GossipRemote {
             try {
                 //The call is not blocking -> If the queue is empty we timeoute a little before retrying
                 Job job = queue.pollFirst();
-                if (job != null) executeJob(job);
-                else Thread.sleep(QUEUE_POLL_SLEEP_MS);
-                
+                if (job == null) {
+                    Thread.sleep(QUEUE_POLL_SLEEP_MS);
+                    continue;
+                }
+                // Defense in depth alongside the guard in stealJob and the proactive removal in
+                // pushResult: a job can still be a stale queue entry left by a DELEGATED timeout that
+                // turned out to be a false alarm. Running it again would be a real duplicate
+                // execution, not just wasted bookkeeping, so it is discarded instead of executed.
+                if (job.getStatus() == JobStatus.COMPLETED || job.getStatus() == JobStatus.FAILED) {
+                    gossipService.recordLocalLoadChange(-1);
+                    log(job, "Discarded stale completed job found in queue (not re-executed)");
+                    continue;
+                }
+                executeJob(job);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return;
@@ -356,10 +394,15 @@ public class Worker implements WorkerRemote, GossipRemote {
         String originId = job.getOriginWorkerId();
 
         if(originId == null || originId.equals(this.workerId)){
-            persistenceManager.appendEvent("UPDATE_RESULT", result);
-            persistenceManager.appendEvent("UPDATE_JOB", job);
+            // Status must be set BEFORE persisting the job event, not after: recovery relies on
+            // the persisted status to tell a finished job apart from one still in flight
+            // (rebuildQueueAfterRecovery skips only COMPLETED/FAILED). Persisting first captured
+            // the job's *previous* status (RUNNING) as its "final" logged state, so every restart
+            // requeued and re-executed every job this worker had already finished successfully.
             results.put(job.getJobId(), result);
             job.setStatus(result.isSuccess() ? JobStatus.COMPLETED : JobStatus.FAILED);
+            persistenceManager.appendEvent("UPDATE_RESULT", result);
+            persistenceManager.appendEvent("UPDATE_JOB", job);
         }
         else {
             WorkerRemote originStub = peers.get(originId);
@@ -559,6 +602,15 @@ public class Worker implements WorkerRemote, GossipRemote {
     }
 }
 
-//TODO: Cancellazione best-effort sul peer prima del fallback locale: restringerebbe la finestra
-//      di doppia esecuzione fra nodi diversi. La deduplica locale (locallyAccepted) esiste gia,
-//      ed e usata anche dai path di work stealing e di timeout dei job DELEGATED.
+//TODO: Cancellazione best-effort sul peer prima del fallback locale. La deduplica locale
+//      (locallyAccepted) esiste gia ed e usata anche dai path di work stealing e di timeout dei
+//      job DELEGATED, ma protegge solo lo stesso worker: NON impedisce una doppia esecuzione
+//      reale fra due worker diversi quando la copia "fantasma" creata da un falso allarme di
+//      checkDelegatedJobsTimeout (job.getStatus()==DELEGATED da oltre DELEGATED_JOB_TIMEOUT_MS,
+//      indipendentemente da quanto dura il task reale) viene rubata da un terzo worker prima
+//      che arrivi il pushResult vero. Riprodotto dal vivo su cluster a 3 nodi: il task viene
+//      eseguito per intero due volte, su due worker diversi. Il client non se ne accorge — la
+//      guardia su pushResult scarta il secondo risultato che arriva ("Duplicate push result
+//      received... ignored") — quindi resta safe sotto la stessa assunzione at-least-once gia
+//      documentata nel README (punto 7: task deterministici, senza effetti collaterali), ma
+//      spreca CPU reale eseguendo lo stesso task su due nodi.
