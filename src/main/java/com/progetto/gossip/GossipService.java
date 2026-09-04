@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Random;
+import java.util.Collection;
 import java.util.function.LongSupplier;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -108,13 +109,34 @@ public class GossipService {
         scheduler.scheduleWithFixedDelay(this::gossipRound, GOSSIP_INTERVAL_SECONDS, GOSSIP_INTERVAL_SECONDS, TimeUnit.SECONDS);
     }
 
-    /** Called by Worker whenever a locally-executing job is enqueued (+1) or finishes (-1). */
+    /** Called by Worker whenever a locally-executing job is enqueued (+1) or dequeued(finishes/stolen) (-1). */
     public synchronized void recordLocalLoadChange(int delta) {
         localLoad += delta;
         versionCounter++;
         WorkerView current = clusterState.get(workerId);
         long now = clock.getAsLong();
         clusterState.merge(current.withLoad(localLoad, versionCounter, now), now);
+    }
+
+    /** Returns a list of worker that are overloaded from which randomly steal */
+    public synchronized List<String> getHigherLoadPeers() {
+        WorkerView self = clusterState.get(workerId);
+        return clusterState.allViews().stream()
+                            .filter(v -> !v.getWorkerId().equals(workerId))
+                            .filter(v -> peers.containsKey(v.getWorkerId()))
+                            .filter(candidate -> effectiveLoad(candidate) - self.getLoadCount() > LOAD_IMBALANCE_THRESHOLD)
+                            .map(WorkerView::getWorkerId)
+                            .collect(Collectors.toList());
+    }
+
+    /** Computes average cluster load to choose if steal or not */
+    public synchronized double getAverageClusterLoad () {
+        Collection<WorkerView> views = clusterState.allViews();
+        if(views.isEmpty()) return 0.0;
+        int totalLoad = views.stream()
+                        .mapToInt(this::effectiveLoad)
+                        .sum();
+        return (double) totalLoad/views.size();
     }
 
     /**
@@ -153,7 +175,7 @@ public class GossipService {
     }
 
     /**
-     * Lifts the local version counter above whatever version of <em>us</em> the caller is holding.
+     * Lifts the local version counter above whatever version of us the caller is holding.
      * After a restart the counter is back near zero while peers still gossip a high-versioned copy
      * of our old entry; without this, every update we produce would lose the last-writer-wins
      * comparison on the peers' side and our load would stay frozen at its pre-crash value forever.

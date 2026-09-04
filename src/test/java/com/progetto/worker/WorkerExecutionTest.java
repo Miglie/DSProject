@@ -143,7 +143,9 @@ class WorkerExecutionTest {
         // Forwarding is at-least-once by construction, so the same job can legitimately arrive here
         // more than once. Re-running it would double the work and, for a task with side effects,
         // double those too.
-        Job job = new Job(new Task("SLEEP", Map.of("millis", 400)));
+        // origin is a different worker id, mirroring a real forwarded job: this instance is only
+        // ever the delivery target, never the one that created the job.
+        Job job = new Job(new Task("SLEEP", Map.of("millis", 400)), "origin-worker");
 
         worker.forwardJob(job);
         awaitTerminal(job.getJobId());
@@ -227,6 +229,11 @@ class WorkerExecutionTest {
 
         @Override
         public Map<String, WorkerRemote> getKnownPeers() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void pushResult(JobResult result) {
             throw new UnsupportedOperationException();
         }
     }

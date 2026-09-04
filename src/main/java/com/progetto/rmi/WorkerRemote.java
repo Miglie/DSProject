@@ -19,4 +19,8 @@ public interface WorkerRemote extends Remote {
     //Methods for a worker to register when it connects to the net
     void registerPeer(String peerId, WorkerRemote peerStub) throws RemoteException;
     Map<String, WorkerRemote> getKnownPeers() throws RemoteException;
+
+    //TODO:Queste due funzioni devono ancora essere implementate
+    /** Enables a push approach to notify the origin about a JobResult */
+    void pushResult(JobResult result) throws RemoteException;
 }

@@ -6,6 +6,7 @@ import com.progetto.job.Job;
 import com.progetto.job.JobResult;
 import com.progetto.job.JobStatus;
 import com.progetto.job.Task;
+import com.progetto.persistence.PersistenceManager;
 import com.progetto.rmi.GossipRemote;
 import com.progetto.rmi.JobNotCompletedException;
 import com.progetto.rmi.JobNotFoundException;
@@ -22,27 +23,19 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.Set;
-import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 public class Worker implements WorkerRemote, GossipRemote {
 
-    /** How often the origin re-asks a peer for the result of a job it forwarded. */
-    private static final long FORWARD_POLL_INTERVAL_MS = 200;
-
-    /**
-     * Consecutive failed polls before the origin gives up on a peer that had already accepted a
-     * job. Tolerating a few keeps a momentary hiccup from triggering a duplicate local re-run of
-     * a job the peer is still perfectly happily executing.
-     */
-    private static final int MAX_CONSECUTIVE_POLL_FAILURES = 3;
-
     private final String workerId;
-    private final BlockingQueue<Job> queue = new LinkedBlockingQueue<>();
+    private final ConcurrentLinkedDeque<Job> queue = new ConcurrentLinkedDeque<>();
     private final ConcurrentHashMap<String, Job> jobs = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, JobResult> results = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, WorkerRemote> peers = new ConcurrentHashMap<>();
@@ -56,20 +49,53 @@ public class Worker implements WorkerRemote, GossipRemote {
      */
     private final Set<String> locallyAccepted = ConcurrentHashMap.newKeySet();
     private final GossipService gossipService;
+    private final PersistenceManager persistenceManager;
     private final ExecutorService forwardingExecutor = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "worker-forward");
         t.setDaemon(true);
         return t;
     });
+    //Creates a scheduled thread to execute work stealing
+    private final ScheduledExecutorService stealerScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "work-stealer");
+        t.setDaemon(true);
+        return t;
+    });
+    //Controls the timeouts of the jobs which have been delegated to other nodes. If timeout gets surpassed a local
+    //fallback is activated
+    private final ScheduledExecutorService timeoutScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "timeout-watchdog");
+        t.setDaemon(true);
+        return t;
+    });
+    private Random random = new Random();
     private WorkerRemote selfStub; //stub of local worker to send to the other nodes
+
+    //Timeout when we try to poll a empty queue before retrying
+    private static final long QUEUE_POLL_SLEEP_MS = 50L;
+
+    //If the result of a remote job is not received before the timeout, we assume something bad has happened and
+    //queue the task again
+    //WARNING: Tuning this parameter in a good way is fundamental for system performances
+    private static final long DELEGATED_JOB_TIMEOUT_MS = 10000L;
 
     public Worker(String workerId) {
         this.workerId = workerId;
         this.gossipService = new GossipService(workerId, peers);
+        this.persistenceManager = new PersistenceManager(workerId);
+
+        PersistenceManager.RecoveredState state = this.persistenceManager.recoverState();
+        this.jobs.putAll(state.jobs);
+        this.results.putAll(state.results);
+
+        rebuildQueueAfterRecovery();
 
         Thread executorThread = new Thread(this::processLoop, "worker-executor-" + workerId);
         executorThread.setDaemon(true);
         executorThread.start();
+
+        stealerScheduler.scheduleWithFixedDelay(this::attemptWorkSteal, 1, 1, TimeUnit.SECONDS);
+        timeoutScheduler.scheduleWithFixedDelay(this::checkDelegatedJobsTimeout, 2, 2, TimeUnit.SECONDS);
     }
 
     /** A task is submitted by the client. Gossip service is queried to choose if forward to peer or execute locally.
@@ -77,12 +103,13 @@ public class Worker implements WorkerRemote, GossipRemote {
      */
     @Override
     public Job submitJob(Task task) throws RemoteException {
-        Job job = new Job(task);
+        Job job = new Job(task, this.workerId);
         jobs.put(job.getJobId(), job);
 
         String target = gossipService.reserveForwardTarget();
         if (target != null) {
-            job.setStatus(JobStatus.RUNNING);
+            job.setStatus(JobStatus.DELEGATED);
+            persistenceManager.appendEvent("UPDATE_JOB", job);
             log(job, "FORWARDING to peer " + target + " (load balancing)");
             forwardingExecutor.submit(() -> forwardToPeer(job, target));
         } else {
@@ -146,6 +173,8 @@ public class Worker implements WorkerRemote, GossipRemote {
         // path that adds one back, and it needs no extra protocol — a peer we evicted announces
         // itself simply by carrying on gossiping. Without it a node that merely stalled would be
         // gone from our view for good and the cluster would stay split forever.
+        //This is useful when a worker stops and after some time restarts working on its own: not useful
+        //insted when the crash needs to be resolved manually (CTRL C on terminal)
         registerPeer(callerId, callerStub);
         return gossipService.exchangeState(callerState);
     }
@@ -157,33 +186,63 @@ public class Worker implements WorkerRemote, GossipRemote {
         enqueueLocally(job);
     }
 
+    /** Called to steal a job from an overloaded peer */
+    @Override
+    public synchronized Job stealJob(String stealerId) throws RemoteException {
+        if (queue.size() <= 1) return null;
+
+        Job stolenJob = queue.pollLast();
+        if (stolenJob != null) {
+            gossipService.recordLocalLoadChange(-1);
+            locallyAccepted.remove(stolenJob.getJobId());
+            //If a job is being stolen from the origin node, status is changed to delegated
+            if (stolenJob.getOriginWorkerId() != null && stolenJob.getOriginWorkerId().equals(this.workerId)) {
+                stolenJob.setStatus(JobStatus.DELEGATED);
+            }
+            log(stolenJob, "Stolen by peer " + stealerId);
+        }
+
+        return stolenJob;
+    }
+
+    @Override
+    public void pushResult(JobResult result) throws RemoteException {
+        Job job = jobs.get(result.getJobId());
+        if (job != null) {
+            synchronized (job) {
+                if (job.getStatus() == JobStatus.COMPLETED || job.getStatus() == JobStatus.FAILED) {
+                    log(job, "Duplicate push result received from remote peer (ignored).");
+                    return;
+                }
+            }
+            results.put(result.getJobId(), result);
+            job.setStatus(result.isSuccess() ? JobStatus.COMPLETED : JobStatus.FAILED);
+            persistenceManager.appendEvent("UPDATE_RESULT", result);
+            persistenceManager.appendEvent("UPDATE_JOB", job);
+            log(job, "Push result received. Output: " + result.getOutput());
+        }
+    }
+
     /**Enqueue a job for local execution, updating local state. */
     private void enqueueLocally(Job job) throws RemoteException {
         if (!locallyAccepted.add(job.getJobId())) {
             log(job, "SKIPPED (already accepted for local execution here)");
             return;
         }
+        job.setStatus(JobStatus.PENDING);
+        //Saved in the log only if originated in that worker
+        if(job.getOriginWorkerId().equals(this.workerId)) persistenceManager.appendEvent("UPDATE_JOB", job);
         jobs.putIfAbsent(job.getJobId(), job);
         // Counted before the put, not after: the executor could otherwise take and finish the job
         // (recording -1) before the +1 landed, leaving the load permanently negative.
         gossipService.recordLocalLoadChange(1);
-        try {
-            queue.put(job);
-        } catch (InterruptedException e) {
-            // The job never made it into the queue, so nothing will ever record its completion.
-            // Without this the counter keeps the +1 forever and the worker looks busier than it is,
-            // and the guard above would refuse a later, legitimate retry of a job that never ran.
-            gossipService.recordLocalLoadChange(-1);
-            locallyAccepted.remove(job.getJobId());
-            Thread.currentThread().interrupt();
-            throw new RemoteException("Interrupted while queueing job " + job.getJobId(), e);
-        }
+        queue.offerLast(job);
         log(job, "QUEUED locally");
     }
 
     /**
-     * Hands a job to a peer, waits for the peer's result and records it as if this worker had run
-     * it — the client only ever talks to the worker it submitted to.
+     * Hands a job to another peer which is less overloaded, then returns. Result is notify asinchronously
+     * by the executor, which by the way is completely transparent to the origin.
      */
     private void forwardToPeer(Job job, String peerId) {
         try {
@@ -192,12 +251,7 @@ public class Worker implements WorkerRemote, GossipRemote {
                 throw new RemoteException("Peer " + peerId + " is no longer known");
             }
             ((GossipRemote) stub).forwardJob(job);
-            JobResult result = awaitRemoteResult(stub, job.getJobId(), peerId);
-            publishResult(job, result);
-            log(job, "FORWARD to " + peerId + " completed -> output=" + result.getOutput());
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            log(job, "FORWARD to " + peerId + " ABANDONED (worker shutting down)");
+            log(job, "FORWARDED to " + peerId + " (awating for results)");
         } catch (Exception e) {
             log(job, "FORWARD to " + peerId + " FAILED (" + e.getMessage() + "), evicting peer and executing locally instead");
             // Eviction here is not the last word: if the peer was only stalled it re-registers
@@ -217,49 +271,71 @@ public class Worker implements WorkerRemote, GossipRemote {
         }
     }
 
-    /**Polls the remote stub to get result of a job handled by a peer. Only fails <= treshold are tolerated.*/
-    private JobResult awaitRemoteResult(WorkerRemote stub, String jobId, String peerId)
-            throws RemoteException, InterruptedException {
-        int consecutiveFailures = 0;
-        while (true) {
-            // The gossip failure detector may have declared this peer dead while we were polling
-            // it. It is the authoritative, cluster-wide signal and it fires within one heartbeat
-            // threshold; waiting for MAX_CONSECUTIVE_POLL_FAILURES timeouts instead would take
-            // several times longer, with the client blocked the whole while.
-            if (!peers.containsKey(peerId)) {
-                throw new RemoteException("Peer " + peerId + " was evicted from the cluster while holding job " + jobId);
+    private void attemptWorkSteal() {
+        int currentLoad = queue.size();
+        double averageLoad = gossipService.getAverageClusterLoad();
+        if (currentLoad >= averageLoad) return;
+        
+        List<String> targets = gossipService.getHigherLoadPeers();
+        if (targets.isEmpty()) return;
+
+        String targetId = targets.get(random.nextInt(targets.size()));
+        GossipRemote targetStub = (GossipRemote) peers.get(targetId);
+        if (targetStub == null) return;
+        
+        try {
+            Job stolenJob = targetStub.stealJob(this.workerId);
+            if (stolenJob != null) {
+                log(stolenJob, "Stolen from peer " + targetId);
+                enqueueLocally(stolenJob);
             }
-            try {
-                return stub.getResult(jobId);
-            } catch (JobNotCompletedException e) {
-                consecutiveFailures = 0;
-            } catch (JobNotFoundException e) {
-                // The peer accepted the job and then forgot it — it restarted, so nobody is
-                // running it and the origin has to.
-                throw new RemoteException("Peer " + peerId + " lost forwarded job " + jobId, e);
-            } catch (RemoteException e) {
-                if (++consecutiveFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
-                    throw e;
+        } catch (RemoteException e) {
+            System.err.printf("[%s] Error stealing job from peer %s: %s%n", workerId, targetId, e.getMessage());
+            peers.remove(targetId);
+            gossipService.forgetPeer(targetId);
+        }
+    }
+
+    private void checkDelegatedJobsTimeout () {
+        long now = System.currentTimeMillis();
+
+        for (Job job : jobs.values()) {
+            if (job.getStatus() == JobStatus.DELEGATED){
+                synchronized(job) {
+                    if(job.getStatus() == JobStatus.DELEGATED && (now - job.getLastUpdated() >= DELEGATED_JOB_TIMEOUT_MS)){
+                        log(job, "Timeout expired (no push result received). Re-queueing locally");
+                        try {
+                            enqueueLocally(job);
+                        } catch (Exception e) {
+                            System.err.printf("[%s] Error during timeout fallback: " + e.getMessage());
+                        }
+                    }
                 }
             }
-            Thread.sleep(FORWARD_POLL_INTERVAL_MS);
         }
     }
 
     private void processLoop() {
-        while (true) {
+        while (!Thread.currentThread().isInterrupted()) {
             try {
-                Job job = queue.take();
-                executeJob(job);
+                //The call is not blocking -> If the queue is empty we timeoute a little before retrying
+                Job job = queue.pollFirst();
+                if (job != null) executeJob(job);
+                else Thread.sleep(QUEUE_POLL_SLEEP_MS);
+                
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return;
+            }
+            catch (Exception e) {
+                System.err.printf("[%s] Error in processLoop: %s%n", workerId, e.getMessage());
             }
         }
     }
 
     private void executeJob(Job job) {
         job.setStatus(JobStatus.RUNNING);
+        persistenceManager.appendEvent("UPDATE_JOB", job);
         log(job, "RUNNING");
         JobResult result;
         try {
@@ -277,8 +353,45 @@ public class Worker implements WorkerRemote, GossipRemote {
 
     /**Result of a completed job is added to the worker state.*/
     private void publishResult(Job job, JobResult result) {
-        results.put(job.getJobId(), result);
-        job.setStatus(result.isSuccess() ? JobStatus.COMPLETED : JobStatus.FAILED);
+        String originId = job.getOriginWorkerId();
+
+        if(originId == null || originId.equals(this.workerId)){
+            persistenceManager.appendEvent("UPDATE_RESULT", result);
+            persistenceManager.appendEvent("UPDATE_JOB", job);
+            results.put(job.getJobId(), result);
+            job.setStatus(result.isSuccess() ? JobStatus.COMPLETED : JobStatus.FAILED);
+        }
+        else {
+            WorkerRemote originStub = peers.get(originId);
+            if(originStub != null){
+                try{
+                    originStub.pushResult(result);
+                } catch (RemoteException e) {
+                    log(job, "Failed to push result to origin node" + originId + ": " + e.getMessage());
+                }
+            }else {
+                log(job, "Origin worker " + originId + " is not reachable for pushing result. Result saved locally as fallback.");
+                results.put(job.getJobId(), result);
+                job.setStatus(result.isSuccess() ? JobStatus.COMPLETED : JobStatus.FAILED);
+            }
+        }
+    }
+
+    /** Insert again in the queue after recovery only jobs still pending (status PENDING or DELEGATED) or interrupted
+     *  while running with this worker as origin. A job which was delegated remotely is always requeued locally
+     * after recovery, because we do not save information abput the route jobs follow*/
+    private void rebuildQueueAfterRecovery() {
+        for(Job job : jobs.values()) {
+            if(!this.workerId.equals(job.getOriginWorkerId()) ||
+                job.getStatus() == JobStatus.COMPLETED ||
+                job.getStatus() == JobStatus.FAILED) continue;
+            
+            job.setStatus(JobStatus.PENDING);
+            queue.offerLast(job);
+            locallyAccepted.add(job.getJobId());
+            gossipService.recordLocalLoadChange(1);
+            log(job, "Recovered and requeued");
+        }
     }
 
     @SuppressWarnings("unchecked")
@@ -349,6 +462,7 @@ public class Worker implements WorkerRemote, GossipRemote {
                 LocalDateTime.now(), workerId, message + " " + peerId);
     }
 
+    //Setting up RMI, starting GossipService, creating Worker instance
     public static Worker start(String workerId, int port) throws RemoteException {
         // Default RMI response timeout is effectively unbounded. No call blocks for the duration
         // of a job any more (forwardJob() only enqueues, and the origin polls for the result), so
@@ -402,6 +516,7 @@ public class Worker implements WorkerRemote, GossipRemote {
                 }
             }
 
+            //Bootstrap to acquire the ClusterView of seed node and start with already updated inforamtion
             //Only now, after the handshake: the seed filters incoming views against its own peer
             //list, so bootstrapping first would have had it silently discard the half of the
             //exchange we push, and it would have learnt our load a full gossip round later.
@@ -444,5 +559,6 @@ public class Worker implements WorkerRemote, GossipRemote {
     }
 }
 
-//TODO: Log su disco
-//TODO: Ripresa processo crashato tenendo il tutto coerente
+//TODO: Cancellazione best-effort sul peer prima del fallback locale: restringerebbe la finestra
+//      di doppia esecuzione fra nodi diversi. La deduplica locale (locallyAccepted) esiste gia,
+//      ed e usata anche dai path di work stealing e di timeout dei job DELEGATED.

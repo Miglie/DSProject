@@ -12,16 +12,22 @@ public class Job implements Serializable {
     private final Task task;
     private volatile JobStatus status;
     private volatile long lastUpdated;
+    private String originWorkerId;
 
-    public Job(Task task) {
+    public Job(Task task, String origin) {
         this.jobId = UUID.randomUUID().toString();
         this.task = task;
         this.status = JobStatus.PENDING;
         this.lastUpdated = System.currentTimeMillis();
+        this.originWorkerId = origin;
     }
 
     public String getJobId() {
         return jobId;
+    }
+
+    public String getOriginWorkerId() {
+        return originWorkerId;
     }
 
     public Task getTask() {
@@ -43,6 +49,6 @@ public class Job implements Serializable {
 
     @Override
     public String toString() {
-        return "Job{jobId='" + jobId + "', status=" + status + ", task=" + task + '}';
+        return "Job{jobId='" + jobId + "', status=" + status + ", origin " + originWorkerId + "task=" + task + '}';
     }
 }

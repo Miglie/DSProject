@@ -32,6 +32,11 @@ class StubPeer implements WorkerRemote, GossipRemote {
     }
 
     @Override
+    public Job stealJob(String stealerId) {
+        throw new UnsupportedOperationException("StubPeer is not meant to be called");
+    }
+
+    @Override
     public Job submitJob(Task task) {
         throw new UnsupportedOperationException("StubPeer is not meant to be called");
     }
@@ -53,6 +58,11 @@ class StubPeer implements WorkerRemote, GossipRemote {
 
     @Override
     public Map<String, WorkerRemote> getKnownPeers() {
+        throw new UnsupportedOperationException("StubPeer is not meant to be called");
+    }
+
+    @Override
+    public void pushResult(JobResult result) {
         throw new UnsupportedOperationException("StubPeer is not meant to be called");
     }
 }
