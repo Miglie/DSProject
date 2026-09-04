@@ -446,4 +446,3 @@ public class Worker implements WorkerRemote, GossipRemote {
 
 //TODO: Log su disco
 //TODO: Ripresa processo crashato tenendo il tutto coerente
-//TODO: Deduplica dei job rieseguiti localmente dopo un forward fallito (oggi at-least-once)
